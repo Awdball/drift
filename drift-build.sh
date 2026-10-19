@@ -18,7 +18,7 @@ if [ -n "$missing" ]; then
 fi
 
 __ "Installing build dependencies & fetching alpine-make-rootfs"
-apk add --no-cache wget cpio gzip zstd systemd-efistub ukify
+apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community wget cpio gzip zstd systemd-efistub ukify
 wget -q https://raw.githubusercontent.com/alpinelinux/alpine-make-rootfs/v0.7.0/alpine-make-rootfs
 echo '91ceb95b020260832417b01e45ce02c3a250c4527835d1bdf486bf44f80287dc  alpine-make-rootfs' | sha256sum -c
 chmod +x alpine-make-rootfs
@@ -28,7 +28,7 @@ mkdir -p "$ROOTFS_DEST/etc/mkinitfs"
 echo "disable_trigger=yes" > "$ROOTFS_DEST/etc/mkinitfs/mkinitfs.conf"
 basename "$1" > "$ROOTFS_DEST/etc/drift-release"
 
-export ALPINE_BRANCH=v3.21
+export ALPINE_BRANCH=v3.22
 export SCRIPT_CHROOT=yes
 export FS_SKEL_DIR=/mnt/root
 export FS_SKEL_CHOWN=root:root

@@ -1,5 +1,6 @@
 #!/bin/sh
 set -e
+cd "$(dirname "$0")"
 
 mkdir -p images
 
@@ -29,7 +30,7 @@ case "$1" in
     sync-host-secrets)
         echo "Syncing host SSH keys, authorized_keys, and zpool.cache into root/..."
         mkdir -p root/etc/ssh root/root/.ssh root/etc/zfs
-        if [ -f /etc/ssh/ssh_host_ed25519_key ]; then
+        if sudo -n test -r /etc/ssh/ssh_host_ed25519_key 2>/dev/null; then
             sudo cp /etc/ssh/ssh_host_ed25519_key root/etc/ssh/ssh_host_ed25519_key
             sudo cp /etc/ssh/ssh_host_ed25519_key.pub root/etc/ssh/ssh_host_ed25519_key.pub
             sudo chown "$(id -u):$(id -g)" root/etc/ssh/ssh_host_ed25519_key*
@@ -60,7 +61,7 @@ case "$1" in
         echo "Building UKI image: $image"
         docker run --privileged --rm -i \
             -v "$PWD":/mnt -w /root \
-            alpine:3.21 /mnt/drift-build.sh "/mnt/images/$image"
+            alpine:3.22 /mnt/drift-build.sh "/mnt/images/$image"
         ;;
     qemu)
         image=$(latest_image)
@@ -69,7 +70,7 @@ case "$1" in
             exit 1
         fi
         echo "Running $image in QEMU (terminate with Ctrl-A X)..."
-        OVMF_BIOS="/usr/share/ovmf/x64/OVMF.4m.fd"
+        OVMF_BIOS="/usr/share/edk2/x64/OVMF.4m.fd"
         [ ! -f "$OVMF_BIOS" ] && OVMF_BIOS="/usr/share/OVMF/OVMF_CODE.fd"
         qemu-system-x86_64 -enable-kvm -cpu host -m 4G -smp 4 -nographic \
             -bios "$OVMF_BIOS" \
