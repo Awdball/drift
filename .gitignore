@@ -1,0 +1,12 @@
+# Built Unified Kernel Images & QEMU test artifacts
+/images/
+/QEMU_EFI.fd
+/OVMF_VARS.fd
+/*.img
+
+# Host-specific secrets & cache injected before build
+/root/etc/ssh/ssh_host_*_key
+/root/etc/ssh/ssh_host_*_key.pub
+/root/root/.ssh/authorized_keys
+/root/etc/zfs/zpool.cache
+

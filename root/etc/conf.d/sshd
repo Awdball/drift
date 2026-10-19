@@ -1,0 +1,2 @@
+# Only use the pre-baked Ed25519 host key
+sshd_disable_keygen=yes

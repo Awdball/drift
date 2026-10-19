@@ -1,0 +1,41 @@
+# Base system & Kernel
+alpine-base
+linux-lts
+zfs-lts
+zfs
+intel-ucode
+linux-firmware-none
+util-linux
+iproute2
+bridge
+ethtool
+nftables
+ca-certificates
+tzdata
+
+# Hypervisor (KVM / QEMU / UEFI)
+qemu-system-x86_64
+qemu-img
+ovmf
+
+# Storage & NFS Server
+eudev
+nfs-utils
+smartmontools
+nvme-cli
+dosfstools
+e2fsprogs
+gptfdisk
+sgdisk
+
+# Networking, Netboot HA & Administration
+openssh
+openntpd
+cronie
+keepalived
+tftp-hpa
+darkhttpd
+curl
+htop
+tmux
+netcat-openbsd

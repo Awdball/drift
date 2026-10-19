@@ -1,0 +1,8 @@
+kvm
+kvm-intel
+vfio
+vfio_iommu_type1
+vfio_pci
+tun
+bridge
+nfsd

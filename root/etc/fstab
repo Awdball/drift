@@ -1,0 +1,5 @@
+# Bounded tmpfs mounts so logs or temporary files never exhaust host RAM
+tmpfs           /tmp        tmpfs   nosuid,nodev,size=512M,mode=1777    0 0
+tmpfs           /run        tmpfs   nosuid,nodev,size=128M,mode=0755    0 0
+tmpfs           /var/log    tmpfs   nosuid,nodev,size=256M,mode=0755    0 0
+LABEL=EFI       /boot/efi   vfat    noatime,rw,fmask=0177,dmask=0077    0 0
