@@ -1,0 +1,102 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh
+
+description="Auto-configure hostname, br0 IP, and Talos VM MAC from hardware NIC"
+
+depend() {
+    need sysfs devfs udev-settle
+    before hostname networking
+}
+
+start() {
+    ebegin "Detecting hardware identity for drift"
+
+    PHYS_NIC="eth0"
+    PHYS_MAC=""
+
+    for netdev in /sys/class/net/*; do
+        dev=$(basename "$netdev")
+        case "$dev" in
+            lo|wlan*|wlp*|br*|tap*|tun*|veth*|bond*|dummy*) continue ;;
+        esac
+        if [ -e "$netdev/device" ] && [ ! -d "$netdev/wireless" ]; then
+            PHYS_NIC="$dev"
+            PHYS_MAC=$(tr '[:upper:]' '[:lower:]' < "$netdev/address" 2>/dev/null)
+            break
+        fi
+    done
+
+    case "$PHYS_MAC" in
+        a8:a1:59:61:e4:8e)
+            NODE_NAME="hv"
+            NODE_IP="192.168.0.254"
+            VM_MAC="52:54:00:a8:00:fe"
+            ;;
+        04:42:1a:e6:83:0c)
+            NODE_NAME="steam-worker"
+            NODE_IP="192.168.0.6"
+            VM_MAC="52:54:00:a8:00:06"
+            ;;
+        *)
+            NODE_NAME="drift-test"
+            NODE_IP="dhcp"
+            VM_MAC="52:54:00:a8:00:99"
+            ;;
+    esac
+
+    echo "$NODE_NAME" > /etc/hostname
+    hostname "$NODE_NAME"
+
+    mkdir -p /etc/conf.d
+    cat <<CONF > /etc/conf.d/talos-vm
+VM_NAME="talos-${NODE_NAME}"
+VM_MAC="${VM_MAC}"
+CONF
+
+    if [ "$NODE_IP" = "dhcp" ]; then
+        cat <<NET > /etc/network/interfaces
+auto lo
+iface lo inet loopback
+
+auto ${PHYS_NIC}
+iface ${PHYS_NIC} inet manual
+
+auto br0
+iface br0 inet dhcp
+    bridge-ports ${PHYS_NIC}
+    bridge-stp off
+    bridge-fd 0
+NET
+    else
+        cat <<NET > /etc/network/interfaces
+auto lo
+iface lo inet loopback
+
+auto ${PHYS_NIC}
+iface ${PHYS_NIC} inet manual
+
+auto br0
+iface br0 inet static
+    address ${NODE_IP}
+    netmask 255.255.255.0
+    gateway 192.168.0.1
+    bridge-ports ${PHYS_NIC}
+    bridge-stp off
+    bridge-fd 0
+NET
+    fi
+
+    cat <<ISSUE > /etc/issue
+
+======================================================================
+  Drift Hypervisor (Alpine Linux UKI) — Node: ${NODE_NAME} (${NODE_IP})
+  Physical NIC : ${PHYS_NIC} (${PHYS_MAC}) -> Bridged on br0
+  Talos KVM VM : talos-${NODE_NAME} (MAC ${VM_MAC})
+  VM Console   : nc -U /run/talos-vm.console  (or tail -f /var/log/talos-vm.log)
+======================================================================
+
+ISSUE
+
+    einfo "Configured node '${NODE_NAME}' (${NODE_IP}) on ${PHYS_NIC} (${PHYS_MAC})"
+    eend 0
+}

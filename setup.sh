@@ -10,7 +10,8 @@ rc-update add udev-trigger sysinit
 rc-update add udev-settle sysinit
 rc-update add cgroups sysinit
 
-# Boot runlevel (Storage & Network come up BEFORE default daemons)
+# Boot runlevel (Identity, Storage & Network come up BEFORE default daemons)
+rc-update add drift-identity boot
 rc-update add hwclock boot
 rc-update add modules boot
 rc-update add sysctl boot
@@ -41,4 +42,4 @@ mkdir -p /boot/efi /var/lib/nfs /var/log /tmp /run
 chmod 600 /etc/ssh/ssh_host_ed25519_key
 chmod 700 /root/.ssh
 chmod 600 /root/.ssh/authorized_keys
-chmod +x /etc/init.d/talos-vm
+chmod +x /etc/init.d/drift-identity /etc/init.d/talos-vm
