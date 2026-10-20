@@ -31,6 +31,7 @@ rc-update add openntpd default
 rc-update add sshd default
 rc-update add rpcbind default
 rc-update add nfs default
+rc-update add zfs-share default
 rc-update add talos-vm default
 
 # Shutdown runlevel
@@ -38,7 +39,7 @@ rc-update add killprocs shutdown
 rc-update add mount-ro shutdown
 
 # Ensure required runtime directories and permissions exist
-mkdir -p /boot/efi /var/lib/nfs /var/log /tmp /run
+mkdir -p /boot/efi /var/lib/nfs /etc/exports.d /var/log /tmp /run
 chmod 600 /etc/ssh/ssh_host_ed25519_key
 chmod 700 /root/.ssh
 chmod 600 /root/.ssh/authorized_keys
