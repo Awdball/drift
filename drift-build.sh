@@ -18,7 +18,7 @@ if [ -n "$missing" ]; then
 fi
 
 __ "Installing build dependencies & fetching alpine-make-rootfs"
-apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community wget cpio gzip zstd systemd-efistub ukify
+apk add --no-cache wget cpio gzip zstd systemd-efistub ukify
 wget -q https://raw.githubusercontent.com/alpinelinux/alpine-make-rootfs/v0.7.0/alpine-make-rootfs
 echo '91ceb95b020260832417b01e45ce02c3a250c4527835d1bdf486bf44f80287dc  alpine-make-rootfs' | sha256sum -c
 chmod +x alpine-make-rootfs
@@ -28,7 +28,7 @@ mkdir -p "$ROOTFS_DEST/etc/mkinitfs"
 echo "disable_trigger=yes" > "$ROOTFS_DEST/etc/mkinitfs/mkinitfs.conf"
 basename "$1" > "$ROOTFS_DEST/etc/drift-release"
 
-export ALPINE_BRANCH=v3.22
+export ALPINE_BRANCH=edge
 export SCRIPT_CHROOT=yes
 export FS_SKEL_DIR=/mnt/root
 export FS_SKEL_CHOWN=root:root
@@ -44,15 +44,15 @@ __ "Building Unified Kernel Image (UKI)"
 # Note: vfio-pci.ids is intentionally omitted here so the EFI framebuffer / HDMI console
 # remains active during early boot, networking, and ZFS import for local troubleshooting.
 # The Intel UHD 630 iGPU (0000:00:02.0) is dynamically bound to vfio-pci when talos-vm starts.
-CMDLINE="rdinit=/sbin/init console=ttyS0,115200n8 console=tty0 intel_iommu=on iommu=pt"
+CMDLINE="rdinit=/sbin/init console=ttyS0,115200n8 console=tty0 intel_iommu=on amd_iommu=on iommu=pt"
 
 ukify build \
     --output "$1" \
     --cmdline "$CMDLINE" \
     --linux "$ROOTFS_DEST/boot/vmlinuz-lts" \
     --initrd "$ROOTFS_DEST/boot/intel-ucode.img" \
+    --initrd "$ROOTFS_DEST/boot/amd-ucode.img" \
     --initrd "$ROOTFS_DEST/boot/initramfs-lts" \
     --os-release "@$ROOTFS_DEST/etc/drift-release"
 
-__ "Build complete: $1 ($(du -h "$1" | cut -f1))"
-
+__ "Build complete: $1 ($(ls -lh "$1" | awk '{print $5}'))"

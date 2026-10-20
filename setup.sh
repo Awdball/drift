@@ -22,7 +22,7 @@ rc-update add seedrng boot
 rc-update add zfs-import boot
 rc-update add zfs-mount boot
 
-# Default runlevel (NFS Server, SSH, Netboot HA, and Talos KVM VM)
+# Default runlevel (NFS Server, SSH, and Talos KVM VM)
 rc-update add udev-postmount default
 rc-update add acpid default
 rc-update add crond default
@@ -30,9 +30,6 @@ rc-update add openntpd default
 rc-update add sshd default
 rc-update add rpcbind default
 rc-update add nfs default
-rc-update add keepalived default
-rc-update add in.tftpd default
-rc-update add darkhttpd default
 rc-update add talos-vm default
 
 # Shutdown runlevel
@@ -40,9 +37,8 @@ rc-update add killprocs shutdown
 rc-update add mount-ro shutdown
 
 # Ensure required runtime directories and permissions exist
-mkdir -p /boot/efi /var/lib/nfs /var/log /tmp /run /tftpboot /var/www/localhost/htdocs
+mkdir -p /boot/efi /var/lib/nfs /var/log /tmp /run
 chmod 600 /etc/ssh/ssh_host_ed25519_key
 chmod 700 /root/.ssh
 chmod 600 /root/.ssh/authorized_keys
 chmod +x /etc/init.d/talos-vm
-

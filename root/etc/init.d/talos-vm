@@ -13,34 +13,20 @@ VM_MAC="52:54:00:a8:00:fe"
 TAP_IF="tap-talos0"
 IGPU_BDF="0000:00:02.0"
 
-# Raw NVMe partitions passed directly for native microsecond I/O
-TALOS_SYS_DISK="/dev/nvme0n1p2"
-PLEX_DB_DISK="/dev/nvme0n1p3"
-
-command_args="
-    -name talos-cp-hv
-    -machine q35,accel=kvm,kernel-irqchip=split
-    -cpu host,migratable=off
-    -smp ${VM_CPUS},sockets=1,cores=5,threads=2
-    -m ${VM_MEM}
-    -bios /usr/share/ovmf/x64/OVMF.4m.fd
-    -nographic
-    -serial mon:stdio
-    -rtc base=utc,clock=host
-    -device virtio-rng-pci
-    -netdev tap,id=net0,ifname=${TAP_IF},script=no,downscript=no,vhost=on
-    -device virtio-net-pci,netdev=net0,mac=${VM_MAC},bootindex=2
-    -drive file=${TALOS_SYS_DISK},format=raw,if=none,id=sysdisk,cache=none,aio=native,discard=unmap
-    -device virtio-blk-pci,drive=sysdisk,serial=talos-sys,bootindex=1
-    -drive file=${PLEX_DB_DISK},format=raw,if=none,id=plexdisk,cache=none,aio=native,discard=unmap
-    -device virtio-blk-pci,drive=plexdisk,serial=plex-nvme
-    -device vfio-pci,host=${IGPU_BDF}
-    -qmp unix:/run/talos-vm.qmp,server,nowait
-"
+# Strictly use GPT partition labels so raw partitions (like /dev/nvme0n1p2) are NEVER touched accidentally
+TALOS_SYS_DISK="/dev/disk/by-partlabel/talos-sys"
+PLEX_DB_DISK="/dev/disk/by-partlabel/plex-nvme"
 
 depend() {
-    need net nfs zfs-mount
-    after keepalived sshd
+    need net
+    after zfs-mount nfs sshd
+}
+
+has_intel_igpu() {
+    [ -e "/sys/bus/pci/devices/${IGPU_BDF}/vendor" ] || return 1
+    vendor=$(cat "/sys/bus/pci/devices/${IGPU_BDF}/vendor" 2>/dev/null)
+    device=$(cat "/sys/bus/pci/devices/${IGPU_BDF}/device" 2>/dev/null)
+    [ "$vendor" = "0x8086" ] && [ "$device" = "0x3e92" ]
 }
 
 bind_igpu_vfio() {
@@ -61,13 +47,56 @@ bind_igpu_vfio() {
 }
 
 start_pre() {
+    # Skip nested VM launch if running inside a small (< 16 GiB RAM) local QEMU test VM
+    mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+    if [ "${mem_kb:-0}" -lt 16000000 ] && [ ! -b "${TALOS_SYS_DISK}" ]; then
+        ewarn "Test VM environment detected (< 16 GiB RAM and no ${TALOS_SYS_DISK}); skipping nested Talos VM launch."
+        return 1
+    fi
+
+    if [ -b "${TALOS_SYS_DISK}" ]; then
+        SYS_DRIVE_ARGS="-drive file=${TALOS_SYS_DISK},format=raw,if=none,id=sysdisk,cache=none,aio=native,discard=unmap -device virtio-blk-pci,drive=sysdisk,serial=talos-sys,bootindex=1"
+    else
+        ewarn "GPT label ${TALOS_SYS_DISK} not found; using non-destructive ephemeral disk /tmp/talos-ephemeral.qcow2"
+        qemu-img create -f qcow2 /tmp/talos-ephemeral.qcow2 20G >/dev/null
+        SYS_DRIVE_ARGS="-drive file=/tmp/talos-ephemeral.qcow2,format=qcow2,if=none,id=sysdisk,discard=unmap -device virtio-blk-pci,drive=sysdisk,serial=talos-sys,bootindex=1"
+    fi
+
+    PLEX_DRIVE_ARGS=""
+    if [ -b "${PLEX_DB_DISK}" ]; then
+        PLEX_DRIVE_ARGS="-drive file=${PLEX_DB_DISK},format=raw,if=none,id=plexdisk,cache=none,aio=native,discard=unmap -device virtio-blk-pci,drive=plexdisk,serial=plex-nvme"
+    fi
+
+    IGPU_ARGS=""
+    if has_intel_igpu; then
+        bind_igpu_vfio
+        IGPU_ARGS="-device vfio-pci,host=${IGPU_BDF}"
+    fi
+
     if ! ip link show "${TAP_IF}" >/dev/null 2>&1; then
         ip tuntap add dev "${TAP_IF}" mode tap
     fi
     ip link set "${TAP_IF}" master br0
     ip link set "${TAP_IF}" up
 
-    bind_igpu_vfio
+    command_args="
+        -name talos-cp-hv
+        -machine q35,accel=kvm,kernel-irqchip=split
+        -cpu host,migratable=off
+        -smp ${VM_CPUS},sockets=1,cores=5,threads=2
+        -m ${VM_MEM}
+        -bios /usr/share/ovmf/x64/OVMF.4m.fd
+        -nographic
+        -serial mon:stdio
+        -rtc base=utc,clock=host
+        -device virtio-rng-pci
+        -netdev tap,id=net0,ifname=${TAP_IF},script=no,downscript=no,vhost=on
+        -device virtio-net-pci,netdev=net0,mac=${VM_MAC},bootindex=2
+        ${SYS_DRIVE_ARGS}
+        ${PLEX_DRIVE_ARGS}
+        ${IGPU_ARGS}
+        -qmp unix:/run/talos-vm.qmp,server,nowait
+    "
 }
 
 stop() {

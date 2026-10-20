@@ -2,4 +2,5 @@
 tmpfs           /tmp        tmpfs   nosuid,nodev,size=512M,mode=1777    0 0
 tmpfs           /run        tmpfs   nosuid,nodev,size=128M,mode=0755    0 0
 tmpfs           /var/log    tmpfs   nosuid,nodev,size=256M,mode=0755    0 0
-LABEL=EFI       /boot/efi   vfat    noatime,rw,fmask=0177,dmask=0077    0 0
+# Read-only & noauto by default so PXE/test boots never touch the NVMe EFI partition
+LABEL=EFI       /boot/efi   vfat    noatime,ro,noauto,fmask=0177,dmask=0077 0 0
