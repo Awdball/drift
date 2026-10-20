@@ -6,7 +6,9 @@ mkdir -p images
 
 PXE_HOST="${PXE_HOST:-pi@192.168.0.1}"
 PXE_DEST="${PXE_DEST:-/data/netboot_assets/drift.efi}"
+PXE_SPLIT_DIR="${PXE_SPLIT_DIR:-/data/netboot_assets/drift}"
 PXE_URL="${PXE_URL:-http://192.168.0.1:8080/drift.efi}"
+PXE_SPLIT_URL="${PXE_SPLIT_URL:-http://192.168.0.1:8080/drift}"
 
 latest_image() {
     ls -1 images 2>/dev/null | sort | tail -n 1
@@ -75,10 +77,19 @@ case "$1" in
         fi
         echo "Uploading images/$image to ${PXE_HOST}:${PXE_DEST}..."
         scp "images/$image" "${PXE_HOST}:${PXE_DEST}.new"
-        ssh "${PXE_HOST}" "mv ${PXE_DEST}.new ${PXE_DEST}"
-        echo "Verifying HTTP PXE endpoint (${PXE_URL})..."
+        ssh "${PXE_HOST}" "mkdir -p ${PXE_SPLIT_DIR} && mv ${PXE_DEST}.new ${PXE_DEST}"
+        echo "Extracting split kernel/initramfs for iPXE compatibility (BIOS & UEFI)..."
+        objcopy -O binary --only-section=.linux "images/$image" /tmp/drift-vmlinuz-lts
+        objcopy -O binary --only-section=.initrd "images/$image" /tmp/drift-initramfs-lts
+        scp /tmp/drift-vmlinuz-lts "${PXE_HOST}:${PXE_SPLIT_DIR}/vmlinuz-lts.new"
+        scp /tmp/drift-initramfs-lts "${PXE_HOST}:${PXE_SPLIT_DIR}/initramfs-lts.new"
+        ssh "${PXE_HOST}" "mv ${PXE_SPLIT_DIR}/vmlinuz-lts.new ${PXE_SPLIT_DIR}/vmlinuz-lts && mv ${PXE_SPLIT_DIR}/initramfs-lts.new ${PXE_SPLIT_DIR}/initramfs-lts"
+        rm -f /tmp/drift-vmlinuz-lts /tmp/drift-initramfs-lts
+        echo "Verifying HTTP PXE endpoints (${PXE_URL} & ${PXE_SPLIT_URL})..."
         curl -fsSI "${PXE_URL}"
-        echo "Published $image to ${PXE_URL}"
+        curl -fsSI "${PXE_SPLIT_URL}/vmlinuz-lts"
+        curl -fsSI "${PXE_SPLIT_URL}/initramfs-lts"
+        echo "Published $image to ${PXE_URL} and ${PXE_SPLIT_URL}/"
         ;;
     qemu)
         image=$(latest_image)
