@@ -37,3 +37,5 @@ curl
 htop
 tmux
 netcat-openbsd
+bind-tools
+nmap
