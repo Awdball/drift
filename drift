@@ -65,9 +65,13 @@ case "$1" in
             image=$(next_image)
         fi
         echo "Building UKI image: $image"
-        docker run --privileged --rm -i \
-            -v "$PWD":/mnt -w /root \
-            alpine:edge /mnt/drift-build.sh "/mnt/images/$image"
+        if command -v docker >/dev/null 2>&1; then
+            docker run --privileged --rm -i \
+                -v "$PWD":/mnt -w /root \
+                alpine:edge /mnt/drift-build.sh "/mnt/images/$image"
+        else
+            ./drift-build.sh "images/$image"
+        fi
         ;;
     publish)
         image=$(latest_image)
