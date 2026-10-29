@@ -62,9 +62,22 @@ start_pre() {
     fi
 
     if [ -b "${TALOS_SYS_DISK}" ]; then
-        SYS_DRIVE_ARGS="-drive file=${TALOS_SYS_DISK},format=raw,if=none,id=sysdisk,cache=none,aio=native,discard=unmap -device virtio-blk-pci,drive=sysdisk,serial=talos-sys,bootindex=1"
-    else
-        ewarn "GPT label ${TALOS_SYS_DISK} not found; using non-destructive ephemeral disk /tmp/talos-ephemeral.qcow2"
+        SYS_DRIVE_ARGS="-drive file=${TALOS_SYS_DISK},format=raw,if=none,id=sysdisk,cache=unsafe,aio=threads,discard=unmap -device virtio-blk-pci,drive=sysdisk,serial=talos-sys,bootindex=1"
+    elif [ -b /dev/nvme0n1p2 ]; then
+        mkdir -p /mnt/nvme
+        mountpoint -q /mnt/nvme || mount -o noatime /dev/nvme0n1p2 /mnt/nvme || true
+        if [ -f /mnt/nvme/talos-hv-sys.raw ]; then
+            SYS_DRIVE_ARGS="-drive file=/mnt/nvme/talos-hv-sys.raw,format=raw,if=none,id=sysdisk,cache=unsafe,aio=threads,discard=unmap -device virtio-blk-pci,drive=sysdisk,serial=talos-sys,bootindex=1"
+        fi
+        if [ -d /mnt/nvme/plex/config ]; then
+            mkdir -p /plex/config
+            mountpoint -q /plex/config || mount --bind /mnt/nvme/plex/config /plex/config || true
+            exportfs -ra 2>/dev/null || true
+        fi
+    fi
+
+    if [ -z "${SYS_DRIVE_ARGS}" ]; then
+        ewarn "No persistent Talos disk found; using non-destructive ephemeral disk /tmp/talos-ephemeral.qcow2"
         qemu-img create -f qcow2 /tmp/talos-ephemeral.qcow2 20G >/dev/null
         SYS_DRIVE_ARGS="-drive file=/tmp/talos-ephemeral.qcow2,format=qcow2,if=none,id=sysdisk,discard=unmap -device virtio-blk-pci,drive=sysdisk,serial=talos-sys,bootindex=1"
     fi
@@ -85,6 +98,7 @@ start_pre() {
     fi
     ip link set "${TAP_IF}" master br0
     ip link set "${TAP_IF}" up
+    ip link set dev br0 address "${PHYS_MAC:-a8:a1:59:61:e4:8e}"
 
     OVMF_BIOS="/usr/share/ovmf/x64/OVMF.4m.fd"
     [ ! -f "$OVMF_BIOS" ] && OVMF_BIOS="/usr/share/OVMF/OVMF.fd"
@@ -110,18 +124,31 @@ start_pre() {
     "
 }
 
-stop() {
-    ebegin "Sending ACPI powerdown to Talos VM"
+start_post() {
+    if [ -x /usr/local/bin/talosctl ] && [ -f "/etc/talos/${NODE_NAME}-controlplane.yaml" ]; then
+        (
+            TALOS_TARGET="192.168.10.10"
+            [ "${NODE_NAME}" = "steam-worker" ] && TALOS_TARGET="192.168.10.11"
+            for i in $(seq 1 60); do
+                if /usr/local/bin/talosctl -n "${TALOS_TARGET}" version >/dev/null 2>&1; then
+                    break
+                fi
+                if /usr/local/bin/talosctl apply-config --insecure -n "${TALOS_TARGET}" --file "/etc/talos/${NODE_NAME}-controlplane.yaml" 2>/dev/null; then
+                    break
+                fi
+                sleep 2
+            done
+        ) &
+    fi
+}
+
+stop_pre() {
     if [ -S /run/talos-vm.qmp ]; then
         printf '{"execute":"qmp_capabilities"}\n{"execute":"system_powerdown"}\n' \
-            | nc -U /run/talos-vm.qmp >/dev/null 2>&1 || true
-        i=0
-        while [ $i -lt 60 ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; do
-            sleep 1
-            i=$((i + 1))
-        done
+            | nc -w 1 -U /run/talos-vm.qmp >/dev/null 2>&1 || true
     fi
-    default_stop
+}
+
+stop_post() {
     ip link del "${TAP_IF}" 2>/dev/null || true
-    eend $?
 }

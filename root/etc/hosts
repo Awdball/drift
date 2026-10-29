@@ -1,5 +1,5 @@
 127.0.0.1       localhost
-192.168.0.1     firewalla.awdball.lan firewalla netboot.awdball.lan netboot
-192.168.0.254   hv.awdball.lan hv
-192.168.0.5     alpine-rpi4.awdball.lan alpine-rpi4
-192.168.0.6     steam-worker.awdball.lan steam-worker
+192.168.10.1     firewalla.awdball.lan firewalla netboot.awdball.lan netboot
+192.168.10.2     hv.awdball.lan hv
+192.168.10.10    talos.awdball.lan talos
+192.168.10.11    steam-worker.awdball.lan steam-worker

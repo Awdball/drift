@@ -44,3 +44,4 @@ chmod 600 /etc/ssh/ssh_host_ed25519_key
 chmod 700 /root/.ssh
 chmod 600 /root/.ssh/authorized_keys
 chmod +x /etc/init.d/drift-identity /etc/init.d/talos-vm
+sed -i -E 's|^(root:.*:)/bin/.*sh$|\1/bin/bash|' /etc/passwd

@@ -2,10 +2,10 @@
 
 `drift` builds a single-file Unified Kernel Image (`.efi`) containing an entire Alpine Linux system in an `initramfs` (`zstd` compressed), inspired by Filippo Valsorda's [`frood`](https://words.filippo.io/dispatches/frood/).
 
-It is tailored specifically for **`hv` (`192.168.0.254`)** in the `awdball.lan` cluster to serve as:
+It is tailored specifically for **`hv` (`192.168.10.2`)** in the `awdball.lan` cluster to serve as:
 1. **Authoritative ZFS Storage Host:** Imports the 6x 8TB RAIDZ2 `storage` pool (`11.7 TB`) in kernel space (`zfs_arc_max=5 GiB`).
 2. **Kernel-Space NFS Server (`nfsd`):** Automatically exports datasets with `sharenfs` properties (`storage/mediaslave`, `storage/containers`, `storage/out-of-band`) before any VM starts.
-3. **High-Availability iPXE / TFTP Endpoint:** Runs `keepalived` backup for the floating netboot VIP (`192.168.0.250`) alongside `alpine-rpi4`.
+3. **High-Availability iPXE / TFTP Endpoint:** Runs `keepalived` backup for the floating netboot VIP (`192.168.10.10`) alongside `alpine-rpi4`.
 4. **KVM Hypervisor for Talos Linux:** Launches the Talos Control Plane VM (`22 GiB` RAM, `10` vCPUs) with raw `virtio-blk` NVMe partitions (`/dev/nvme0n1p2` for Talos system, `/dev/nvme0n1p3` for Plex SQLite DB) and **late-bound VFIO passthrough** of the Intel UHD Graphics 630 (`0000:00:02.0`) for hardware QuickSync transcoding.
 
 ---

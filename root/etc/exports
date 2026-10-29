@@ -1,0 +1,2 @@
+/plex/config 192.168.0.0/16(rw,async,no_root_squash,no_subtree_check,fsid=100)
+

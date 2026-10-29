@@ -29,18 +29,24 @@ start() {
     case "$PHYS_MAC" in
         a8:a1:59:61:e4:8e)
             NODE_NAME="hv"
-            NODE_IP="192.168.0.254"
+            NODE_IP="dhcp"
             VM_MAC="52:54:00:a8:00:fe"
+            VM_CPUS="10"
+            VM_MEM="22G"
             ;;
         04:42:1a:e6:83:0c)
             NODE_NAME="steam-worker"
-            NODE_IP="192.168.0.6"
+            NODE_IP="dhcp"
             VM_MAC="52:54:00:a8:00:06"
+            VM_CPUS="14"
+            VM_MEM="48G"
             ;;
         *)
             NODE_NAME="drift-test"
             NODE_IP="dhcp"
             VM_MAC="52:54:00:a8:00:99"
+            VM_CPUS="4"
+            VM_MEM="4G"
             ;;
     esac
 
@@ -49,8 +55,12 @@ start() {
 
     mkdir -p /etc/conf.d
     cat <<CONF > /etc/conf.d/talos-vm
+NODE_NAME="${NODE_NAME}"
 VM_NAME="talos-${NODE_NAME}"
 VM_MAC="${VM_MAC}"
+VM_CPUS="${VM_CPUS}"
+VM_MEM="${VM_MEM}"
+PHYS_MAC="${PHYS_MAC}"
 CONF
 
     if [ "$NODE_IP" = "dhcp" ]; then
@@ -64,6 +74,7 @@ iface ${PHYS_NIC} inet manual
 auto br0
 iface br0 inet dhcp
     bridge-ports ${PHYS_NIC}
+    hwaddress ether ${PHYS_MAC}
     bridge-stp off
     bridge-fd 0
 NET
