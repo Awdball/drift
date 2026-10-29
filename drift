@@ -2,16 +2,16 @@
 set -e
 cd "$(dirname "$0")"
 
-mkdir -p images
+mkdir -p images images/netboot
 
-PXE_HOST="${PXE_HOST:-pi@192.168.0.1}"
+PXE_HOST="${PXE_HOST:-pi@192.168.10.1}"
 PXE_DEST="${PXE_DEST:-/data/netboot_assets/drift.efi}"
 PXE_SPLIT_DIR="${PXE_SPLIT_DIR:-/data/netboot_assets/drift}"
-PXE_URL="${PXE_URL:-http://192.168.0.1:8080/drift.efi}"
-PXE_SPLIT_URL="${PXE_SPLIT_URL:-http://192.168.0.1:8080/drift}"
+PXE_URL="${PXE_URL:-http://192.168.10.1:8080/drift.efi}"
+PXE_SPLIT_URL="${PXE_SPLIT_URL:-http://192.168.10.1:8080/drift}"
 
 latest_image() {
-    ls -1 images 2>/dev/null | sort | tail -n 1
+    ls -1 images/*.efi 2>/dev/null | sort | tail -n 1
 }
 
 next_image() {
@@ -75,16 +75,22 @@ case "$1" in
             echo "No built image found in images/. Run './drift build' first." >&2
             exit 1
         fi
-        echo "Uploading images/$image to ${PXE_HOST}:${PXE_DEST}..."
-        scp "images/$image" "${PXE_HOST}:${PXE_DEST}.new"
+        echo "Uploading $image to ${PXE_HOST}:${PXE_DEST}..."
+        scp "$image" "${PXE_HOST}:${PXE_DEST}.new"
         ssh "${PXE_HOST}" "mkdir -p ${PXE_SPLIT_DIR} && mv ${PXE_DEST}.new ${PXE_DEST}"
-        echo "Extracting split kernel/initramfs for iPXE compatibility (BIOS & UEFI)..."
-        objcopy -O binary --only-section=.linux "images/$image" /tmp/drift-vmlinuz-lts
-        objcopy -O binary --only-section=.initrd "images/$image" /tmp/drift-initramfs-lts
-        scp /tmp/drift-vmlinuz-lts "${PXE_HOST}:${PXE_SPLIT_DIR}/vmlinuz-lts.new"
-        scp /tmp/drift-initramfs-lts "${PXE_HOST}:${PXE_SPLIT_DIR}/initramfs-lts.new"
+        echo "Uploading split kernel/initramfs for iPXE compatibility (BIOS & UEFI)..."
+        if [ -f "images/netboot/vmlinuz-lts" ] && [ -f "images/netboot/initramfs-lts" ]; then
+            scp images/netboot/vmlinuz-lts "${PXE_HOST}:${PXE_SPLIT_DIR}/vmlinuz-lts.new"
+            scp images/netboot/initramfs-lts "${PXE_HOST}:${PXE_SPLIT_DIR}/initramfs-lts.new"
+        else
+            echo "Extracting split kernel/initramfs from UKI..."
+            objcopy -O binary --only-section=.linux "$image" /tmp/drift-vmlinuz-lts
+            objcopy -O binary --only-section=.initrd "$image" /tmp/drift-initramfs-lts
+            scp /tmp/drift-vmlinuz-lts "${PXE_HOST}:${PXE_SPLIT_DIR}/vmlinuz-lts.new"
+            scp /tmp/drift-initramfs-lts "${PXE_HOST}:${PXE_SPLIT_DIR}/initramfs-lts.new"
+            rm -f /tmp/drift-vmlinuz-lts /tmp/drift-initramfs-lts
+        fi
         ssh "${PXE_HOST}" "mv ${PXE_SPLIT_DIR}/vmlinuz-lts.new ${PXE_SPLIT_DIR}/vmlinuz-lts && mv ${PXE_SPLIT_DIR}/initramfs-lts.new ${PXE_SPLIT_DIR}/initramfs-lts"
-        rm -f /tmp/drift-vmlinuz-lts /tmp/drift-initramfs-lts
         echo "Verifying HTTP PXE endpoints (${PXE_URL} & ${PXE_SPLIT_URL})..."
         curl -fsSI "${PXE_URL}"
         curl -fsSI "${PXE_SPLIT_URL}/vmlinuz-lts"
@@ -103,7 +109,7 @@ case "$1" in
         [ ! -f "$OVMF_BIOS" ] && OVMF_BIOS="/usr/share/OVMF/OVMF_CODE.fd"
         qemu-system-x86_64 -enable-kvm -cpu host -m 4G -smp 4 -nographic \
             -bios "$OVMF_BIOS" \
-            -kernel "images/$image" \
+            -kernel "$image" \
             -netdev user,id=net0,hostfwd=tcp::2222-:22 \
             -device virtio-net-pci,netdev=net0
         ;;
@@ -114,12 +120,12 @@ case "$1" in
             exit 1
         fi
         TARGET_ESP="${2:-/boot/efi/EFI/BOOT/BOOTX64.EFI}"
-        echo "Deploying images/$image to $TARGET_ESP..."
+        echo "Deploying $image to $TARGET_ESP..."
         if [ -f "$TARGET_ESP" ]; then
             sudo cp "$TARGET_ESP" "${TARGET_ESP}.prev"
         fi
         sudo mkdir -p "$(dirname "$TARGET_ESP")"
-        sudo cp "images/$image" "${TARGET_ESP}.new"
+        sudo cp "$image" "${TARGET_ESP}.new"
         sudo mv "${TARGET_ESP}.new" "$TARGET_ESP"
         sync
         echo "Successfully deployed $image to $TARGET_ESP (backup at ${TARGET_ESP}.prev)"

@@ -13,16 +13,18 @@ mkdir -p "$TMPDIR"
 ROOTFS_DEST=$(mktemp -d -p "$TMPDIR")
 trap 'rm -rf "$ROOTFS_DEST"' EXIT
 
-__ "Checking required host secrets in $PROJECT_DIR"
-missing=""
-for req in /root/etc/ssh/ssh_host_ed25519_key /root/root/.ssh/authorized_keys; do
-    if [ ! -e "$PROJECT_DIR$req" ]; then
-        missing="${missing}  ${req}\n"
-    fi
-done
-if [ -n "$missing" ]; then
-    printf "Missing required files (run './drift sync-host-secrets' first):\n%b" "$missing" >&2
-    exit 1
+__ "Checking host secrets in $PROJECT_DIR"
+# Ensure SSH directories exist
+mkdir -p "$PROJECT_DIR/root/etc/ssh" "$PROJECT_DIR/root/root/.ssh"
+
+# If host SSH keys or authorized_keys are not present, provide defaults/warnings rather than aborting build
+if [ ! -f "$PROJECT_DIR/root/etc/ssh/ssh_host_ed25519_key" ]; then
+    printf "Note: No baked-in ssh_host_ed25519_key found. Host keys will be auto-generated or loaded from ESP seed.\n"
+fi
+if [ ! -f "$PROJECT_DIR/root/root/.ssh/authorized_keys" ]; then
+    touch "$PROJECT_DIR/root/root/.ssh/authorized_keys"
+    chmod 600 "$PROJECT_DIR/root/root/.ssh/authorized_keys"
+    printf "Note: Created empty authorized_keys. Public keys can be supplied via drift.env or ESP seed.\n"
 fi
 
 __ "Installing build dependencies & fetching alpine-make-rootfs"
@@ -51,6 +53,13 @@ export PACKAGES="$(grep -v '^\s*#' "$PROJECT_DIR/packages" | tr '\n' ' ')"
 __ "Packing initramfs (zstd compressed)"
 cd "$ROOTFS_DEST"
 find . -path "./boot" -prune -o -print | cpio -o -H newc | zstd -19 -T0 > "$ROOTFS_DEST/boot/initramfs-lts"
+
+__ "Exporting netboot assets (vmlinuz-lts and initramfs-lts)"
+NETBOOT_DIR="$(dirname "$TARGET")/netboot"
+mkdir -p "$NETBOOT_DIR"
+cp "$ROOTFS_DEST/boot/vmlinuz-lts" "$NETBOOT_DIR/vmlinuz-lts"
+cp "$ROOTFS_DEST/boot/initramfs-lts" "$NETBOOT_DIR/initramfs-lts"
+printf "Netboot assets exported to %s\n" "$NETBOOT_DIR"
 
 __ "Building Unified Kernel Image (UKI)"
 CMDLINE="rdinit=/sbin/init console=ttyS0,115200n8 console=tty0 intel_iommu=on amd_iommu=on iommu=pt"

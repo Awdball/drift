@@ -1,7 +1,7 @@
 #!/sbin/openrc-run
 # shellcheck shell=sh
 
-description="Auto-configure hostname, br0 IP, and Talos VM MAC from hardware NIC"
+description="Auto-configure hostname, br0 IP, SSH keys, and Talos VM identity from hardware NIC and optional seed"
 
 depend() {
     need sysfs devfs udev-settle
@@ -14,41 +14,149 @@ start() {
     PHYS_NIC="eth0"
     PHYS_MAC=""
 
+    # Pass 1: Find physical NIC with active carrier link
     for netdev in /sys/class/net/*; do
         dev=$(basename "$netdev")
         case "$dev" in
             lo|wlan*|wlp*|br*|tap*|tun*|veth*|bond*|dummy*) continue ;;
         esac
         if [ -e "$netdev/device" ] && [ ! -d "$netdev/wireless" ]; then
-            PHYS_NIC="$dev"
-            PHYS_MAC=$(tr '[:upper:]' '[:lower:]' < "$netdev/address" 2>/dev/null)
-            break
+            if [ -f "$netdev/carrier" ] && [ "$(cat "$netdev/carrier" 2>/dev/null)" = "1" ]; then
+                PHYS_NIC="$dev"
+                PHYS_MAC=$(tr '[:upper:]' '[:lower:]' < "$netdev/address" 2>/dev/null)
+                break
+            fi
         fi
     done
 
+    # Pass 2: If no active carrier detected, pick first physical NIC
+    if [ -z "$PHYS_MAC" ]; then
+        for netdev in /sys/class/net/*; do
+            dev=$(basename "$netdev")
+            case "$dev" in
+                lo|wlan*|wlp*|br*|tap*|tun*|veth*|bond*|dummy*) continue ;;
+            esac
+            if [ -e "$netdev/device" ] && [ ! -d "$netdev/wireless" ]; then
+                PHYS_NIC="$dev"
+                PHYS_MAC=$(tr '[:upper:]' '[:lower:]' < "$netdev/address" 2>/dev/null)
+                break
+            fi
+        done
+    fi
+
+    # Probe EFI System Partition or FAT32 drives for optional seed config (drift.env) and persistent SSH keys
+    SEED_MNT="/tmp/drift-seed"
+    mkdir -p "$SEED_MNT"
+    SEED_FOUND=""
+
+    for cand in /dev/disk/by-partlabel/ESP /dev/disk/by-label/ESP /dev/disk/by-partlabel/EFI* /dev/disk/by-label/EFI* $(blkid -t TYPE=vfat -o device 2>/dev/null); do
+        if [ -b "$cand" ]; then
+            if mount "$cand" "$SEED_MNT" 2>/dev/null || mount -o ro "$cand" "$SEED_MNT" 2>/dev/null; then
+                # Check for drift.env
+                if [ -f "$SEED_MNT/EFI/drift/drift.env" ]; then
+                    einfo "Loading seed config from $cand: /EFI/drift/drift.env"
+                    . "$SEED_MNT/EFI/drift/drift.env"
+                    SEED_FOUND="yes"
+                elif [ -f "$SEED_MNT/drift.env" ]; then
+                    einfo "Loading seed config from $cand: /drift.env"
+                    . "$SEED_MNT/drift.env"
+                    SEED_FOUND="yes"
+                fi
+
+                # Check for persistent SSH host keys on ESP
+                if [ -f "$SEED_MNT/EFI/drift/ssh_host_ed25519_key" ]; then
+                    einfo "Restoring persistent SSH host key from $cand"
+                    mkdir -p /etc/ssh
+                    cp "$SEED_MNT/EFI/drift/ssh_host_ed25519_key" /etc/ssh/ssh_host_ed25519_key
+                    chmod 600 /etc/ssh/ssh_host_ed25519_key
+                    [ -f "$SEED_MNT/EFI/drift/ssh_host_ed25519_key.pub" ] && cp "$SEED_MNT/EFI/drift/ssh_host_ed25519_key.pub" /etc/ssh/ssh_host_ed25519_key.pub
+                elif [ ! -f /etc/ssh/ssh_host_ed25519_key ] && touch "$SEED_MNT/EFI/drift/.writable" 2>/dev/null; then
+                    rm -f "$SEED_MNT/EFI/drift/.writable"
+                    einfo "Generating persistent SSH host key on $cand"
+                    mkdir -p "$SEED_MNT/EFI/drift" /etc/ssh
+                    ssh-keygen -t ed25519 -N "" -f "$SEED_MNT/EFI/drift/ssh_host_ed25519_key"
+                    cp "$SEED_MNT/EFI/drift/ssh_host_ed25519_key"* /etc/ssh/
+                    chmod 600 /etc/ssh/ssh_host_ed25519_key
+                fi
+
+                # Check for persistent authorized_keys on ESP
+                if [ -f "$SEED_MNT/EFI/drift/authorized_keys" ]; then
+                    mkdir -p /root/.ssh
+                    cat "$SEED_MNT/EFI/drift/authorized_keys" >> /root/.ssh/authorized_keys
+                    chmod 600 /root/.ssh/authorized_keys
+                fi
+
+                umount "$SEED_MNT" 2>/dev/null || true
+                [ -n "$SEED_FOUND" ] && break
+            fi
+        fi
+    done
+    rmdir "$SEED_MNT" 2>/dev/null || true
+
+    # Inject AUTHORIZED_KEYS if provided in drift.env
+    if [ -n "$AUTHORIZED_KEYS" ]; then
+        mkdir -p /root/.ssh
+        printf "%s\n" "$AUTHORIZED_KEYS" >> /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+    fi
+
+    # Ensure host SSH key exists so sshd can always start
+    if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
+        mkdir -p /etc/ssh
+        ssh-keygen -t ed25519 -N "" -f /etc/ssh/ssh_host_ed25519_key
+        chmod 600 /etc/ssh/ssh_host_ed25519_key
+    fi
+
+    # Host & VM Identity: Evaluate known hardware profiles, fallback to dynamic hardware detection
     case "$PHYS_MAC" in
         a8:a1:59:61:e4:8e)
-            NODE_NAME="hv"
-            NODE_IP="dhcp"
-            VM_MAC="52:54:00:a8:00:fe"
-            VM_CPUS="10"
-            VM_MEM="22G"
+            NODE_NAME="${NODE_NAME:-hv}"
+            NODE_IP="${NODE_IP:-dhcp}"
+            VM_MAC="${VM_MAC:-52:54:00:a8:00:fe}"
+            VM_CPUS="${VM_CPUS:-10}"
+            VM_MEM="${VM_MEM:-22G}"
             ;;
         04:42:1a:e6:83:0c)
-            NODE_NAME="steam-worker"
-            NODE_IP="dhcp"
-            VM_MAC="52:54:00:a8:00:06"
-            VM_CPUS="14"
-            VM_MEM="48G"
+            NODE_NAME="${NODE_NAME:-steam-worker}"
+            NODE_IP="${NODE_IP:-dhcp}"
+            VM_MAC="${VM_MAC:-52:54:00:a8:00:06}"
+            VM_CPUS="${VM_CPUS:-14}"
+            VM_MEM="${VM_MEM:-48G}"
             ;;
         *)
-            NODE_NAME="drift-test"
-            NODE_IP="dhcp"
-            VM_MAC="52:54:00:a8:00:99"
-            VM_CPUS="4"
-            VM_MEM="4G"
+            # Dynamic naming derived from last 4 characters of physical MAC
+            MAC_SUFFIX=$(echo "$PHYS_MAC" | tr -d ':' | tail -c 5)
+            NODE_NAME="${NODE_NAME:-drift-${MAC_SUFFIX}}"
+            NODE_IP="${NODE_IP:-dhcp}"
+
+            # Locally administered unicast VM MAC derived from physical MAC
+            if [ -z "$VM_MAC" ]; then
+                if [ -n "$PHYS_MAC" ]; then
+                    VM_MAC=$(echo "$PHYS_MAC" | awk -F: '{printf "52:54:%02x:%02x:%02x:%02x", "0x"$3, "0x"$4, "0x"$5, "0x"$6}')
+                else
+                    VM_MAC="52:54:00:a8:00:99"
+                fi
+            fi
+
+            # Auto-size VM CPUs: reserve 2 cores for host OS, assign remaining
+            if [ -z "$VM_CPUS" ]; then
+                HOST_CPUS=$(nproc 2>/dev/null || echo 4)
+                VM_CPUS=$((HOST_CPUS > 2 ? HOST_CPUS - 2 : 1))
+            fi
+
+            # Auto-size VM Memory: allocate ~60% of total host RAM
+            if [ -z "$VM_MEM" ]; then
+                TOTAL_RAM_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 8388608)
+                TOTAL_RAM_MB=$((TOTAL_RAM_KB / 1024))
+                CALC_MEM_MB=$((TOTAL_RAM_MB * 60 / 100))
+                [ "$CALC_MEM_MB" -lt 2048 ] && CALC_MEM_MB=2048
+                VM_MEM="${CALC_MEM_MB}M"
+            fi
             ;;
     esac
+
+    VM_NAME="${VM_NAME:-talos-${NODE_NAME}}"
+    PASSTHROUGH_GPU="${PASSTHROUGH_GPU:-auto}"
 
     echo "$NODE_NAME" > /etc/hostname
     hostname "$NODE_NAME"
@@ -56,11 +164,14 @@ start() {
     mkdir -p /etc/conf.d
     cat <<CONF > /etc/conf.d/talos-vm
 NODE_NAME="${NODE_NAME}"
-VM_NAME="talos-${NODE_NAME}"
+VM_NAME="${VM_NAME}"
 VM_MAC="${VM_MAC}"
 VM_CPUS="${VM_CPUS}"
 VM_MEM="${VM_MEM}"
+PHYS_NIC="${PHYS_NIC}"
 PHYS_MAC="${PHYS_MAC}"
+PASSTHROUGH_GPU="${PASSTHROUGH_GPU}"
+TALOS_SYS_DISK="${TALOS_SYS_DISK}"
 CONF
 
     if [ "$NODE_IP" = "dhcp" ]; then
@@ -79,6 +190,8 @@ iface br0 inet dhcp
     bridge-fd 0
 NET
     else
+        NODE_NETMASK="${NODE_NETMASK:-255.255.255.0}"
+        NODE_GATEWAY="${NODE_GATEWAY:-192.168.10.1}"
         cat <<NET > /etc/network/interfaces
 auto lo
 iface lo inet loopback
@@ -89,12 +202,16 @@ iface ${PHYS_NIC} inet manual
 auto br0
 iface br0 inet static
     address ${NODE_IP}
-    netmask 255.255.255.0
-    gateway 192.168.0.1
+    netmask ${NODE_NETMASK}
+    gateway ${NODE_GATEWAY}
     bridge-ports ${PHYS_NIC}
+    hwaddress ether ${PHYS_MAC}
     bridge-stp off
     bridge-fd 0
 NET
+        if [ -n "$NODE_DNS" ]; then
+            echo "nameserver ${NODE_DNS}" > /etc/resolv.conf
+        fi
     fi
 
     cat <<ISSUE > /etc/issue
@@ -102,7 +219,7 @@ NET
 ======================================================================
   Drift Hypervisor (Alpine Linux UKI) — Node: ${NODE_NAME} (${NODE_IP})
   Physical NIC : ${PHYS_NIC} (${PHYS_MAC}) -> Bridged on br0
-  Talos KVM VM : talos-${NODE_NAME} (MAC ${VM_MAC})
+  Talos KVM VM : ${VM_NAME} (CPUs: ${VM_CPUS}, RAM: ${VM_MEM}, MAC: ${VM_MAC})
   VM Console   : nc -U /run/talos-vm.console  (or tail -f /var/log/talos-vm.log)
 ======================================================================
 
