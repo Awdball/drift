@@ -35,6 +35,7 @@ openntpd
 cronie
 curl
 htop
+iotop
 tmux
 netcat-openbsd
 bind-tools
