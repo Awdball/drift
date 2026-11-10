@@ -3,92 +3,215 @@
 
 description="Auto-configure hostname, br0 IP, SSH keys, and Talos VM identity from hardware NIC and optional seed"
 
+DRIFT_STATE_DIR="${DRIFT_STATE_DIR:-/run/drift}"
+IDENTITY_STATE_FILE="${DRIFT_STATE_DIR}/identity.env"
+
 depend() {
     need sysfs devfs udev-settle
     before hostname networking
 }
 
-start() {
-    ebegin "Detecting hardware identity for drift"
+write_identity_state() {
+    mkdir -p "$DRIFT_STATE_DIR" 2>/dev/null || true
+    cat <<EOF > "${IDENTITY_STATE_FILE}.tmp"
+DRIFT_SCHEMA_VERSION="1"
+SERVICE_STATE="${SERVICE_STATE:-ready}"
+IDENTITY_STATE="${IDENTITY_STATE:-unknown}"
+NIC_STATE="${NIC_STATE:-unknown}"
+SEED_STATE="${SEED_STATE:-none_found}"
+SEED_SOURCE="${SEED_SOURCE:-}"
+SSH_KEY_STATE="${SSH_KEY_STATE:-unknown}"
+NODE_NAME="${NODE_NAME:-}"
+NODE_IP="${NODE_IP:-dhcp}"
+PHYS_NIC="${PHYS_NIC:-}"
+PHYS_MAC="${PHYS_MAC:-}"
+VM_NAME="${VM_NAME:-}"
+VM_MAC="${VM_MAC:-}"
+VM_CPUS="${VM_CPUS:-}"
+VM_MEM="${VM_MEM:-}"
+PASSTHROUGH_GPU="${PASSTHROUGH_GPU:-auto}"
+TALOS_SYS_DISK="${TALOS_SYS_DISK:-}"
+TALOS_VM_IP="${TALOS_VM_IP:-}"
+UPDATED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo unknown)"
+EOF
+    mv "${IDENTITY_STATE_FILE}.tmp" "$IDENTITY_STATE_FILE" 2>/dev/null || true
+}
 
-    PHYS_NIC="eth0"
+is_candidate_nic() {
+    case "$1" in
+        lo|wlan*|wlp*|br*|tap*|tun*|veth*|bond*|dummy*|docker*|virbr*|sit*|ip6tnl*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+discover_physical_nic() {
+    NIC_STATE="probing"
+    PHYS_NIC=""
     PHYS_MAC=""
 
-    # Pass 1: Find physical NIC with active carrier link
+    # Bring physical NIC candidates administratively UP so PHY carrier detection works during early boot
+    candidates=""
     for netdev in /sys/class/net/*; do
+        [ -e "$netdev" ] || continue
         dev=$(basename "$netdev")
-        case "$dev" in
-            lo|wlan*|wlp*|br*|tap*|tun*|veth*|bond*|dummy*) continue ;;
-        esac
+        is_candidate_nic "$dev" || continue
         if [ -e "$netdev/device" ] && [ ! -d "$netdev/wireless" ]; then
-            if [ -f "$netdev/carrier" ] && [ "$(cat "$netdev/carrier" 2>/dev/null)" = "1" ]; then
-                PHYS_NIC="$dev"
-                PHYS_MAC=$(tr '[:upper:]' '[:lower:]' < "$netdev/address" 2>/dev/null)
-                break
-            fi
+            candidates="$candidates $dev"
+            ip link set dev "$dev" up 2>/dev/null || true
         fi
     done
 
-    # Pass 2: If no active carrier detected, pick first physical NIC
-    if [ -z "$PHYS_MAC" ]; then
-        for netdev in /sys/class/net/*; do
-            dev=$(basename "$netdev")
-            case "$dev" in
-                lo|wlan*|wlp*|br*|tap*|tun*|veth*|bond*|dummy*) continue ;;
-            esac
-            if [ -e "$netdev/device" ] && [ ! -d "$netdev/wireless" ]; then
-                PHYS_NIC="$dev"
-                PHYS_MAC=$(tr '[:upper:]' '[:lower:]' < "$netdev/address" 2>/dev/null)
+    # Pass 1: Poll up to 3s (12 x 250ms) for an active carrier link on physical candidates
+    if [ -n "$candidates" ]; then
+        attempt=0
+        while [ "$attempt" -lt 12 ]; do
+            for dev in $candidates; do
+                netdev="/sys/class/net/$dev"
+                if [ -f "$netdev/carrier" ] && [ "$(cat "$netdev/carrier" 2>/dev/null)" = "1" ]; then
+                    PHYS_NIC="$dev"
+                    PHYS_MAC=$(tr '[:upper:]' '[:lower:]' < "$netdev/address" 2>/dev/null)
+                    NIC_STATE="carrier_up"
+                    return 0
+                fi
+            done
+            # If only one physical NIC exists and it already has a valid MAC, wait at most 500ms
+            if [ "$(echo "$candidates" | wc -w)" -eq 1 ] && [ "$attempt" -ge 2 ]; then
                 break
+            fi
+            sleep 0.25 2>/dev/null || sleep 1
+            attempt=$((attempt + 1))
+        done
+
+        # Pass 2: Pick first physical NIC with a valid MAC address
+        for dev in $candidates; do
+            netdev="/sys/class/net/$dev"
+            mac=$(tr '[:upper:]' '[:lower:]' < "$netdev/address" 2>/dev/null)
+            if [ -n "$mac" ] && [ "$mac" != "00:00:00:00:00:00" ]; then
+                PHYS_NIC="$dev"
+                PHYS_MAC="$mac"
+                NIC_STATE="no_carrier_fallback"
+                return 0
             fi
         done
     fi
+
+    # Pass 3: Fallback for virtualized test environments where /device symlink may vary
+    for netdev in /sys/class/net/*; do
+        [ -e "$netdev" ] || continue
+        dev=$(basename "$netdev")
+        is_candidate_nic "$dev" || continue
+        mac=$(tr '[:upper:]' '[:lower:]' < "$netdev/address" 2>/dev/null)
+        if [ -n "$mac" ] && [ "$mac" != "00:00:00:00:00:00" ]; then
+            PHYS_NIC="$dev"
+            PHYS_MAC="$mac"
+            NIC_STATE="virtual_nic"
+            return 0
+        fi
+    done
+
+    PHYS_NIC="eth0"
+    PHYS_MAC=""
+    NIC_STATE="default_eth0"
+    return 0
+}
+
+dedup_authorized_keys() {
+    target_file="$1"
+    [ -f "$target_file" ] || return 0
+    awk 'NF && !seen[$0]++' "$target_file" > "${target_file}.dedup" && mv "${target_file}.dedup" "$target_file"
+    chmod 600 "$target_file" 2>/dev/null || true
+}
+
+start() {
+    ebegin "Detecting hardware identity for drift"
+    SERVICE_STATE="starting"
+    SEED_STATE="none_found"
+    SEED_SOURCE=""
+    SSH_KEY_STATE="unknown"
+    IDENTITY_STATE="unknown"
+
+    if [ -f /etc/ssh/ssh_host_ed25519_key ]; then
+        SSH_KEY_STATE="baked_initramfs"
+    fi
+
+    discover_physical_nic
 
     # Probe EFI System Partition or FAT32 drives for optional seed config (drift.env) and persistent SSH keys
     SEED_MNT="/tmp/drift-seed"
     mkdir -p "$SEED_MNT"
     SEED_FOUND=""
+    SEEN_DEVS=" "
 
     for cand in /dev/disk/by-partlabel/ESP /dev/disk/by-label/ESP /dev/disk/by-partlabel/EFI* /dev/disk/by-label/EFI* $(blkid -t TYPE=vfat -o device 2>/dev/null); do
-        if [ -b "$cand" ]; then
-            if mount "$cand" "$SEED_MNT" 2>/dev/null || mount -o ro "$cand" "$SEED_MNT" 2>/dev/null; then
-                # Check for drift.env
-                if [ -f "$SEED_MNT/EFI/drift/drift.env" ]; then
-                    einfo "Loading seed config from $cand: /EFI/drift/drift.env"
-                    . "$SEED_MNT/EFI/drift/drift.env"
-                    SEED_FOUND="yes"
-                elif [ -f "$SEED_MNT/drift.env" ]; then
-                    einfo "Loading seed config from $cand: /drift.env"
-                    . "$SEED_MNT/drift.env"
-                    SEED_FOUND="yes"
-                fi
+        [ -b "$cand" ] || continue
+        real_dev=$(readlink -f "$cand" 2>/dev/null || echo "$cand")
+        case "$SEEN_DEVS" in
+            *" $real_dev "*) continue ;;
+        esac
+        SEEN_DEVS="${SEEN_DEVS}${real_dev} "
 
-                # Check for persistent SSH host keys on ESP
-                if [ -f "$SEED_MNT/EFI/drift/ssh_host_ed25519_key" ]; then
-                    einfo "Restoring persistent SSH host key from $cand"
-                    mkdir -p /etc/ssh
-                    cp "$SEED_MNT/EFI/drift/ssh_host_ed25519_key" /etc/ssh/ssh_host_ed25519_key
-                    chmod 600 /etc/ssh/ssh_host_ed25519_key
-                    [ -f "$SEED_MNT/EFI/drift/ssh_host_ed25519_key.pub" ] && cp "$SEED_MNT/EFI/drift/ssh_host_ed25519_key.pub" /etc/ssh/ssh_host_ed25519_key.pub
-                elif [ ! -f /etc/ssh/ssh_host_ed25519_key ] && touch "$SEED_MNT/EFI/drift/.writable" 2>/dev/null; then
-                    rm -f "$SEED_MNT/EFI/drift/.writable"
-                    einfo "Generating persistent SSH host key on $cand"
-                    mkdir -p "$SEED_MNT/EFI/drift" /etc/ssh
-                    ssh-keygen -t ed25519 -N "" -f "$SEED_MNT/EFI/drift/ssh_host_ed25519_key"
-                    cp "$SEED_MNT/EFI/drift/ssh_host_ed25519_key"* /etc/ssh/
-                    chmod 600 /etc/ssh/ssh_host_ed25519_key
-                fi
+        # Check if device is already mounted somewhere (e.g. /boot/efi or /tmp/boot)
+        existing_mnt=$(awk -v d="$real_dev" '$1 == d {print $2; exit}' /proc/mounts 2>/dev/null)
+        unmount_after=0
+        active_mnt=""
 
-                # Check for persistent authorized_keys on ESP
-                if [ -f "$SEED_MNT/EFI/drift/authorized_keys" ]; then
-                    mkdir -p /root/.ssh
-                    cat "$SEED_MNT/EFI/drift/authorized_keys" >> /root/.ssh/authorized_keys
-                    chmod 600 /root/.ssh/authorized_keys
-                fi
+        if [ -n "$existing_mnt" ] && [ -d "$existing_mnt" ]; then
+            active_mnt="$existing_mnt"
+        elif mount "$real_dev" "$SEED_MNT" 2>/dev/null || mount -o ro "$real_dev" "$SEED_MNT" 2>/dev/null; then
+            active_mnt="$SEED_MNT"
+            unmount_after=1
+        fi
 
-                umount "$SEED_MNT" 2>/dev/null || true
-                [ -n "$SEED_FOUND" ] && break
+        if [ -n "$active_mnt" ]; then
+            # Check for drift.env
+            if [ -f "$active_mnt/EFI/drift/drift.env" ]; then
+                einfo "Loading seed config from $real_dev: /EFI/drift/drift.env"
+                # shellcheck disable=SC1090
+                . "$active_mnt/EFI/drift/drift.env"
+                SEED_FOUND="yes"
+                SEED_STATE="loaded"
+                SEED_SOURCE="${real_dev}:/EFI/drift/drift.env"
+            elif [ -f "$active_mnt/drift.env" ]; then
+                einfo "Loading seed config from $real_dev: /drift.env"
+                # shellcheck disable=SC1090
+                . "$active_mnt/drift.env"
+                SEED_FOUND="yes"
+                SEED_STATE="loaded"
+                SEED_SOURCE="${real_dev}:/drift.env"
             fi
+
+            # Check for persistent SSH host keys on ESP
+            if [ -f "$active_mnt/EFI/drift/ssh_host_ed25519_key" ]; then
+                einfo "Restoring persistent SSH host key from $real_dev"
+                mkdir -p /etc/ssh
+                cp "$active_mnt/EFI/drift/ssh_host_ed25519_key" /etc/ssh/ssh_host_ed25519_key
+                chmod 600 /etc/ssh/ssh_host_ed25519_key
+                [ -f "$active_mnt/EFI/drift/ssh_host_ed25519_key.pub" ] && cp "$active_mnt/EFI/drift/ssh_host_ed25519_key.pub" /etc/ssh/ssh_host_ed25519_key.pub
+                SSH_KEY_STATE="esp_restored"
+            elif [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
+                mkdir -p "$active_mnt/EFI/drift" 2>/dev/null || true
+                if touch "$active_mnt/EFI/drift/.writable" 2>/dev/null; then
+                    rm -f "$active_mnt/EFI/drift/.writable"
+                    einfo "Generating persistent SSH host key on $real_dev"
+                    mkdir -p /etc/ssh
+                    ssh-keygen -t ed25519 -N "" -f "$active_mnt/EFI/drift/ssh_host_ed25519_key"
+                    cp "$active_mnt/EFI/drift/ssh_host_ed25519_key"* /etc/ssh/
+                    chmod 600 /etc/ssh/ssh_host_ed25519_key
+                    SSH_KEY_STATE="esp_persisted"
+                fi
+            fi
+
+            # Check for persistent authorized_keys on ESP
+            if [ -f "$active_mnt/EFI/drift/authorized_keys" ]; then
+                mkdir -p /root/.ssh
+                cat "$active_mnt/EFI/drift/authorized_keys" >> /root/.ssh/authorized_keys
+                dedup_authorized_keys /root/.ssh/authorized_keys
+            fi
+
+            if [ "$unmount_after" -eq 1 ]; then
+                umount "$SEED_MNT" 2>/dev/null || true
+            fi
+            [ -n "$SEED_FOUND" ] && break
         fi
     done
     rmdir "$SEED_MNT" 2>/dev/null || true
@@ -97,7 +220,7 @@ start() {
     if [ -n "$AUTHORIZED_KEYS" ]; then
         mkdir -p /root/.ssh
         printf "%s\n" "$AUTHORIZED_KEYS" >> /root/.ssh/authorized_keys
-        chmod 600 /root/.ssh/authorized_keys
+        dedup_authorized_keys /root/.ssh/authorized_keys
     fi
 
     # Ensure host SSH key exists so sshd can always start
@@ -105,9 +228,13 @@ start() {
         mkdir -p /etc/ssh
         ssh-keygen -t ed25519 -N "" -f /etc/ssh/ssh_host_ed25519_key
         chmod 600 /etc/ssh/ssh_host_ed25519_key
+        SSH_KEY_STATE="ephemeral_ram"
     fi
 
-    # Host & VM Identity: Evaluate known hardware profiles, fallback to dynamic hardware detection
+    SEED_HAD_NODE_NAME="${NODE_NAME:-}"
+
+    # Host & VM Identity State Machine:
+    # 1. Explicit seed override -> 2. Known hardware profile -> 3. Dynamic MAC derivation
     case "$PHYS_MAC" in
         a8:a1:59:61:e4:8e)
             NODE_NAME="${NODE_NAME:-hv}"
@@ -115,6 +242,8 @@ start() {
             VM_MAC="${VM_MAC:-52:54:00:a8:00:fe}"
             VM_CPUS="${VM_CPUS:-10}"
             VM_MEM="${VM_MEM:-22G}"
+            TALOS_VM_IP="${TALOS_VM_IP:-192.168.10.10}"
+            IDENTITY_STATE="hardware_profile"
             ;;
         04:42:1a:e6:83:0c)
             NODE_NAME="${NODE_NAME:-steam-worker}"
@@ -122,14 +251,15 @@ start() {
             VM_MAC="${VM_MAC:-52:54:00:a8:00:06}"
             VM_CPUS="${VM_CPUS:-14}"
             VM_MEM="${VM_MEM:-48G}"
+            TALOS_VM_IP="${TALOS_VM_IP:-192.168.10.11}"
+            IDENTITY_STATE="hardware_profile"
             ;;
         *)
-            # Dynamic naming derived from last 4 characters of physical MAC
             MAC_SUFFIX=$(echo "$PHYS_MAC" | tr -d ':' | tail -c 5)
+            [ -z "$MAC_SUFFIX" ] && MAC_SUFFIX="node"
             NODE_NAME="${NODE_NAME:-drift-${MAC_SUFFIX}}"
             NODE_IP="${NODE_IP:-dhcp}"
 
-            # Locally administered unicast VM MAC derived from physical MAC
             if [ -z "$VM_MAC" ]; then
                 if [ -n "$PHYS_MAC" ]; then
                     VM_MAC=$(echo "$PHYS_MAC" | awk -F: '{printf "52:54:%02x:%02x:%02x:%02x", "0x"$3, "0x"$4, "0x"$5, "0x"$6}')
@@ -138,13 +268,11 @@ start() {
                 fi
             fi
 
-            # Auto-size VM CPUs: reserve 2 cores for host OS, assign remaining
             if [ -z "$VM_CPUS" ]; then
                 HOST_CPUS=$(nproc 2>/dev/null || echo 4)
                 VM_CPUS=$((HOST_CPUS > 2 ? HOST_CPUS - 2 : 1))
             fi
 
-            # Auto-size VM Memory: allocate ~60% of total host RAM
             if [ -z "$VM_MEM" ]; then
                 TOTAL_RAM_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 8388608)
                 TOTAL_RAM_MB=$((TOTAL_RAM_KB / 1024))
@@ -152,8 +280,13 @@ start() {
                 [ "$CALC_MEM_MB" -lt 2048 ] && CALC_MEM_MB=2048
                 VM_MEM="${CALC_MEM_MB}M"
             fi
+            IDENTITY_STATE="dynamic_mac"
             ;;
     esac
+
+    if [ -n "$SEED_HAD_NODE_NAME" ]; then
+        IDENTITY_STATE="seed_override"
+    fi
 
     VM_NAME="${VM_NAME:-talos-${NODE_NAME}}"
     PASSTHROUGH_GPU="${PASSTHROUGH_GPU:-auto}"
@@ -172,7 +305,16 @@ PHYS_NIC="${PHYS_NIC}"
 PHYS_MAC="${PHYS_MAC}"
 PASSTHROUGH_GPU="${PASSTHROUGH_GPU}"
 TALOS_SYS_DISK="${TALOS_SYS_DISK}"
+TALOS_VM_IP="${TALOS_VM_IP}"
+IDENTITY_STATE="${IDENTITY_STATE}"
+NIC_STATE="${NIC_STATE}"
+SEED_STATE="${SEED_STATE}"
 CONF
+
+    HWADDR_LINE=""
+    if [ -n "$PHYS_MAC" ]; then
+        HWADDR_LINE="    hwaddress ether ${PHYS_MAC}"
+    fi
 
     if [ "$NODE_IP" = "dhcp" ]; then
         cat <<NET > /etc/network/interfaces
@@ -185,7 +327,7 @@ iface ${PHYS_NIC} inet manual
 auto br0
 iface br0 inet dhcp
     bridge-ports ${PHYS_NIC}
-    hwaddress ether ${PHYS_MAC}
+${HWADDR_LINE}
     bridge-stp off
     bridge-fd 0
 NET
@@ -205,7 +347,7 @@ iface br0 inet static
     netmask ${NODE_NETMASK}
     gateway ${NODE_GATEWAY}
     bridge-ports ${PHYS_NIC}
-    hwaddress ether ${PHYS_MAC}
+${HWADDR_LINE}
     bridge-stp off
     bridge-fd 0
 NET
@@ -218,13 +360,17 @@ NET
 
 ======================================================================
   Drift Hypervisor (Alpine Linux UKI) — Node: ${NODE_NAME} (${NODE_IP})
-  Physical NIC : ${PHYS_NIC} (${PHYS_MAC}) -> Bridged on br0
+  Identity Mode: ${IDENTITY_STATE} (NIC: ${NIC_STATE}, Seed: ${SEED_STATE})
+  Physical NIC : ${PHYS_NIC} (${PHYS_MAC:-none}) -> Bridged on br0
   Talos KVM VM : ${VM_NAME} (CPUs: ${VM_CPUS}, RAM: ${VM_MEM}, MAC: ${VM_MAC})
   VM Console   : nc -U /run/talos-vm.console  (or tail -f /var/log/talos-vm.log)
+  Status CLI   : drift-status  (or drift-status --json)
 ======================================================================
 
 ISSUE
 
-    einfo "Configured node '${NODE_NAME}' (${NODE_IP}) on ${PHYS_NIC} (${PHYS_MAC})"
+    SERVICE_STATE="ready"
+    write_identity_state
+    einfo "Configured node '${NODE_NAME}' [state=${IDENTITY_STATE}, nic=${NIC_STATE}, seed=${SEED_STATE}] on ${PHYS_NIC} (${PHYS_MAC})"
     eend 0
 }

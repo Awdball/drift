@@ -1,0 +1,332 @@
+#!/bin/sh
+# drift-status — Unified State Machine Inspector & JSON Telemetry Generator for Drift Hypervisor
+set -e
+
+DRIFT_STATE_DIR="${DRIFT_STATE_DIR:-/run/drift}"
+IDENTITY_STATE_FILE="${DRIFT_STATE_DIR}/identity.env"
+VM_STATE_FILE="${DRIFT_STATE_DIR}/talos-vm.env"
+JSON_STATE_FILE="${DRIFT_STATE_DIR}/state.json"
+REPO_DIR="${DRIFT_REPO_DIR:-/storage/dev-projects/drift}"
+
+MODE="human"
+if [ "${1:-}" = "--json" ] || [ "${1:-}" = "-j" ]; then
+    MODE="json"
+fi
+
+mkdir -p "$DRIFT_STATE_DIR" 2>/dev/null || true
+
+# Backfill /run/drift/identity.env if running on a pre-existing boot where drift-identity didn't write it yet
+if [ ! -f "$IDENTITY_STATE_FILE" ]; then
+    [ -f /etc/conf.d/talos-vm ] && . /etc/conf.d/talos-vm
+    NODE_NAME="${NODE_NAME:-$(hostname 2>/dev/null || echo unknown)}"
+    if [ -z "${PHYS_NIC:-}" ]; then
+        for d in /sys/class/net/br0/brif/*; do
+            [ -e "$d" ] || continue
+            b=$(basename "$d")
+            case "$b" in tap*) continue ;; *) PHYS_NIC="$b"; break ;; esac
+        done
+        PHYS_NIC="${PHYS_NIC:-eth0}"
+    fi
+    PHYS_MAC="${PHYS_MAC:-$(cat "/sys/class/net/${PHYS_NIC}/address" 2>/dev/null || echo "")}"
+    if [ -f "/sys/class/net/${PHYS_NIC}/carrier" ] && [ "$(cat "/sys/class/net/${PHYS_NIC}/carrier" 2>/dev/null)" = "1" ]; then
+        NIC_STATE="carrier_up"
+    else
+        NIC_STATE="no_carrier_fallback"
+    fi
+    case "$PHYS_MAC" in
+        a8:a1:59:61:e4:8e|04:42:1a:e6:83:0c) IDENTITY_STATE="${IDENTITY_STATE:-hardware_profile}" ;;
+        *) IDENTITY_STATE="${IDENTITY_STATE:-dynamic_mac}" ;;
+    esac
+    SEED_STATE="${SEED_STATE:-none_found}"
+    SSH_KEY_STATE="${SSH_KEY_STATE:-baked_initramfs}"
+    cat <<EOF > "$IDENTITY_STATE_FILE" 2>/dev/null || true
+DRIFT_SCHEMA_VERSION="1"
+SERVICE_STATE="ready"
+IDENTITY_STATE="${IDENTITY_STATE}"
+NIC_STATE="${NIC_STATE}"
+SEED_STATE="${SEED_STATE}"
+SSH_KEY_STATE="${SSH_KEY_STATE}"
+NODE_NAME="${NODE_NAME}"
+NODE_IP="${NODE_IP:-dhcp}"
+PHYS_NIC="${PHYS_NIC}"
+PHYS_MAC="${PHYS_MAC}"
+VM_NAME="${VM_NAME:-talos-${NODE_NAME}}"
+VM_MAC="${VM_MAC:-}"
+VM_CPUS="${VM_CPUS:-}"
+VM_MEM="${VM_MEM:-}"
+PASSTHROUGH_GPU="${PASSTHROUGH_GPU:-auto}"
+UPDATED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo unknown)"
+EOF
+fi
+
+# Load identity state
+[ -f "$IDENTITY_STATE_FILE" ] && . "$IDENTITY_STATE_FILE"
+[ -f /etc/conf.d/talos-vm ] && . /etc/conf.d/talos-vm
+[ -f "$VM_STATE_FILE" ] && . "$VM_STATE_FILE"
+
+# Live introspection of dynamic runtime states
+NOW_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo unknown)"
+DRIFT_VERSION="$(cat /etc/drift-version "$REPO_DIR/VERSION" 2>/dev/null | head -n 1 | tr -d '[:space:]')"
+[ -z "$DRIFT_VERSION" ] && DRIFT_VERSION="1.1.0"
+BOOTED_RELEASE="$(cat /etc/drift-release 2>/dev/null || echo unknown)"
+KERNEL_REL="$(uname -r 2>/dev/null || echo unknown)"
+UPTIME_SEC="$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 0)"
+
+LATEST_BUILT_IMAGE=""
+if [ -d "$REPO_DIR/images" ]; then
+    LATEST_BUILT_IMAGE="$(ls -1 "$REPO_DIR"/images/*.efi 2>/dev/null | sort | tail -n 1 | xargs -r basename 2>/dev/null || echo "")"
+fi
+
+if [ -z "$LATEST_BUILT_IMAGE" ]; then
+    RELEASE_SYNC_STATE="no_local_builds"
+elif [ "$BOOTED_RELEASE" = "$LATEST_BUILT_IMAGE" ]; then
+    RELEASE_SYNC_STATE="current"
+else
+    RELEASE_SYNC_STATE="newer_image_built"
+fi
+
+# Boot method detection
+if [ -d /sys/firmware/efi ]; then
+    if grep -q "ip=" /proc/cmdline 2>/dev/null || grep -q "boot=net" /proc/cmdline 2>/dev/null; then
+        BOOT_METHOD="uefi_ipxe_netboot"
+    else
+        BOOT_METHOD="uefi_local_esp"
+    fi
+else
+    BOOT_METHOD="bios_or_qemu"
+fi
+
+# Network & Bridge live check
+BR0_IP="$(ip -4 -o addr show dev br0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1)"
+[ -z "$BR0_IP" ] && BR0_IP="unassigned"
+BR0_MAC="$(cat /sys/class/net/br0/address 2>/dev/null || echo "")"
+if [ -f "/sys/class/net/${PHYS_NIC:-eth0}/carrier" ] && [ "$(cat "/sys/class/net/${PHYS_NIC:-eth0}/carrier" 2>/dev/null)" = "1" ]; then
+    NIC_STATE="carrier_up"
+fi
+
+# QEMU / Talos VM live state (exclude supervise-daemon wrapper)
+QEMU_PID="$(pgrep -f "^/usr/bin/qemu-system-x86_64.*-name ${VM_NAME:-talos}" 2>/dev/null | head -n 1)"
+[ -z "$QEMU_PID" ] && QEMU_PID="$(pidof qemu-system-x86_64 2>/dev/null | awk '{print $1}')"
+if [ -n "$QEMU_PID" ]; then
+    VM_STATE="running"
+    QEMU_CMDLINE="$(tr '\0' ' ' < "/proc/${QEMU_PID}/cmdline" 2>/dev/null || echo "")"
+    QEMU_RSS_KB="$(awk '/^VmRSS:/ {print $2}' "/proc/${QEMU_PID}/status" 2>/dev/null || echo 0)"
+    QEMU_RSS_MB=$(( ${QEMU_RSS_KB:-0} / 1024 ))
+    case "$QEMU_CMDLINE" in
+        *accel=kvm*) ACCEL_STATE="kvm" ;;
+        *accel=tcg*) ACCEL_STATE="tcg" ;;
+        *) ACCEL_STATE="${ACCEL_STATE:-kvm}" ;;
+    esac
+    if [ -z "${STORAGE_STATE:-}" ] || [ "${STORAGE_STATE}" = "unknown" ]; then
+        case "$QEMU_CMDLINE" in
+            */dev/disk/by-partlabel/*)
+                STORAGE_STATE="persistent_block"
+                STORAGE_SOURCE="/dev/disk/by-partlabel/talos-sys"
+                ;;
+            */mnt/nvme/talos-hv-sys.raw*)
+                STORAGE_STATE="persistent_image"
+                STORAGE_SOURCE="/mnt/nvme/talos-hv-sys.raw"
+                ;;
+            *talos-ephemeral.qcow2*)
+                STORAGE_STATE="ephemeral_qcow2"
+                STORAGE_SOURCE="/tmp/talos-ephemeral.qcow2"
+                ;;
+            *)
+                STORAGE_STATE="persistent_image"
+                ;;
+        esac
+    fi
+else
+    [ "${VM_STATE:-}" != "skipped" ] && [ "${VM_STATE:-}" != "shutting_down" ] && VM_STATE="stopped"
+    QEMU_RSS_MB=0
+fi
+
+if [ -S /run/talos-vm.qmp ]; then
+    QMP_STATE="ready"
+else
+    QMP_STATE="absent"
+fi
+
+if ip link show "${TAP_IF:-tap-talos0}" >/dev/null 2>&1; then
+    TAP_STATE="bridged_up"
+else
+    TAP_STATE="down"
+fi
+
+# GPU VFIO live check
+if [ -z "${IGPU_BDF:-}" ]; then
+    for dev_path in /sys/bus/pci/devices/*; do
+        [ -e "$dev_path/vendor" ] || continue
+        v=$(cat "$dev_path/vendor" 2>/dev/null)
+        c=$(cat "$dev_path/class" 2>/dev/null)
+        if [ "$v" = "0x8086" ]; then
+            case "$c" in 0x0300*|0x0380*) IGPU_BDF=$(basename "$dev_path"); break ;; esac
+        fi
+    done
+fi
+
+if [ -n "${IGPU_BDF:-}" ] && [ -d "/sys/bus/pci/devices/${IGPU_BDF}" ]; then
+    drv=$(basename "$(readlink "/sys/bus/pci/devices/${IGPU_BDF}/driver" 2>/dev/null)" 2>/dev/null || echo "none")
+    if [ "$drv" = "vfio-pci" ]; then
+        GPU_STATE="bound_vfio"
+    elif [ "${PASSTHROUGH_GPU:-auto}" = "disable" ]; then
+        GPU_STATE="disabled"
+    else
+        GPU_STATE="host_driver_${drv}"
+    fi
+else
+    GPU_STATE="${GPU_STATE:-not_present}"
+fi
+
+# Host NVMe & Plex NFS bind-mount state
+if mountpoint -q /mnt/nvme 2>/dev/null; then
+    NVME_STATE="mounted"
+elif [ -b /dev/nvme0n1p2 ]; then
+    NVME_STATE="unmounted"
+else
+    NVME_STATE="not_present"
+fi
+
+if mountpoint -q /plex/config 2>/dev/null; then
+    PLEX_EXPORT_STATE="bound_exported"
+else
+    PLEX_EXPORT_STATE="not_present"
+fi
+
+# ZFS Pool & ARC Telemetry
+ZFS_POOL_STATE="not_imported"
+if command -v zpool >/dev/null 2>&1; then
+    pool_health=$(zpool list -H -o health storage 2>/dev/null || echo "")
+    [ -n "$pool_health" ] && ZFS_POOL_STATE="$pool_health"
+fi
+
+ZFS_ARC_MB=0
+ZFS_ARC_MAX_MB=0
+ZFS_ARC_HIT_PCT="0.0"
+if [ -f /proc/spl/kstat/zfs/arcstats ]; then
+    ZFS_ARC_MB=$(awk '/^size / {printf "%d", $3 / 1048576}' /proc/spl/kstat/zfs/arcstats 2>/dev/null || echo 0)
+    ZFS_ARC_MAX_MB=$(awk '/^c_max / {printf "%d", $3 / 1048576}' /proc/spl/kstat/zfs/arcstats 2>/dev/null || echo 0)
+    ZFS_ARC_HIT_PCT=$(awk '
+        /^hits / {h=$3}
+        /^misses / {m=$3}
+        END { if (h+m > 0) printf "%.2f", (h * 100.0) / (h + m); else printf "0.00" }
+    ' /proc/spl/kstat/zfs/arcstats 2>/dev/null || echo "0.00")
+fi
+
+# Memory State Machine
+MEM_TOTAL_MB=$(awk '/^MemTotal:/ {printf "%d", $2 / 1024}' /proc/meminfo 2>/dev/null || echo 0)
+MEM_AVAIL_MB=$(awk '/^MemAvailable:/ {printf "%d", $2 / 1024}' /proc/meminfo 2>/dev/null || echo 0)
+MEM_FREE_MB=$(awk '/^MemFree:/ {printf "%d", $2 / 1024}' /proc/meminfo 2>/dev/null || echo 0)
+MEM_USED_MB=$(( MEM_TOTAL_MB - MEM_AVAIL_MB ))
+
+if [ "$MEM_AVAIL_MB" -ge 1024 ]; then
+    MEMORY_STATE="healthy"
+elif [ "$MEM_AVAIL_MB" -ge 384 ]; then
+    MEMORY_STATE="pressure"
+else
+    MEMORY_STATE="critical"
+fi
+
+# NFS Server State
+if pgrep -x nfsd >/dev/null 2>&1; then
+    NFS_STATE="running"
+else
+    NFS_STATE="stopped"
+fi
+
+# Write canonical /run/drift/state.json for AX / monitoring consumers
+cat <<EOF > "${JSON_STATE_FILE}.tmp" 2>/dev/null || true
+{
+  "schema_version": 1,
+  "updated_at": "${NOW_UTC}",
+  "host": {
+    "node_name": "${NODE_NAME:-unknown}",
+    "drift_version": "${DRIFT_VERSION}",
+    "boot_method": "${BOOT_METHOD}",
+    "booted_release": "${BOOTED_RELEASE}",
+    "latest_built_image": "${LATEST_BUILT_IMAGE}",
+    "release_sync_state": "${RELEASE_SYNC_STATE}",
+    "kernel": "${KERNEL_REL}",
+    "uptime_seconds": ${UPTIME_SEC:-0}
+  },
+  "identity": {
+    "state": "${IDENTITY_STATE:-unknown}",
+    "seed_state": "${SEED_STATE:-none_found}",
+    "ssh_key_state": "${SSH_KEY_STATE:-unknown}"
+  },
+  "network": {
+    "nic_state": "${NIC_STATE:-unknown}",
+    "phys_nic": "${PHYS_NIC:-eth0}",
+    "phys_mac": "${PHYS_MAC:-}",
+    "bridge_if": "br0",
+    "bridge_ip": "${BR0_IP}",
+    "bridge_mac": "${BR0_MAC}",
+    "tap_state": "${TAP_STATE}",
+    "tap_if": "${TAP_IF:-tap-talos0}"
+  },
+  "memory": {
+    "state": "${MEMORY_STATE}",
+    "total_mb": ${MEM_TOTAL_MB:-0},
+    "used_mb": ${MEM_USED_MB:-0},
+    "available_mb": ${MEM_AVAIL_MB:-0},
+    "free_mb": ${MEM_FREE_MB:-0},
+    "qemu_rss_mb": ${QEMU_RSS_MB:-0},
+    "zfs_arc_mb": ${ZFS_ARC_MB:-0},
+    "zfs_arc_max_mb": ${ZFS_ARC_MAX_MB:-0},
+    "zfs_arc_hit_pct": ${ZFS_ARC_HIT_PCT:-0.0}
+  },
+  "storage": {
+    "zfs_pool_state": "${ZFS_POOL_STATE}",
+    "nfs_state": "${NFS_STATE}",
+    "nvme_state": "${NVME_STATE}",
+    "plex_export_state": "${PLEX_EXPORT_STATE}"
+  },
+  "vm": {
+    "state": "${VM_STATE}",
+    "name": "${VM_NAME:-talos-hv}",
+    "pid": ${QEMU_PID:-0},
+    "cpus": "${VM_CPUS:-0}",
+    "memory": "${VM_MEM:-0}",
+    "mac": "${VM_MAC:-}",
+    "accel_state": "${ACCEL_STATE:-unknown}",
+    "storage_state": "${STORAGE_STATE:-unknown}",
+    "storage_source": "${STORAGE_SOURCE:-}",
+    "gpu_state": "${GPU_STATE}",
+    "igpu_bdf": "${IGPU_BDF:-}",
+    "qmp_state": "${QMP_STATE}",
+    "bootstrap_state": "${BOOTSTRAP_STATE:-already_configured}"
+  }
+}
+EOF
+mv "${JSON_STATE_FILE}.tmp" "$JSON_STATE_FILE" 2>/dev/null || true
+
+if [ "$MODE" = "json" ]; then
+    cat "$JSON_STATE_FILE"
+    exit 0
+fi
+
+printf "======================================================================\n"
+printf "  DRIFT HYPERVISOR v%s STATE MACHINE STATUS — %s (%s)\n" "${DRIFT_VERSION}" "${NODE_NAME}" "${BR0_IP}"
+printf "======================================================================\n"
+printf "  [Host & Release]\n"
+printf "    Boot Method        : %s\n" "${BOOT_METHOD}"
+printf "    Booted UKI Release : %s (kernel %s)\n" "${BOOTED_RELEASE}" "${KERNEL_REL}"
+printf "    Latest Built UKI   : %s (sync=%s)\n" "${LATEST_BUILT_IMAGE:-none}" "${RELEASE_SYNC_STATE}"
+printf "\n  [Identity & Network]\n"
+printf "    Identity State     : %s (seed=%s, ssh_key=%s)\n" "${IDENTITY_STATE}" "${SEED_STATE}" "${SSH_KEY_STATE}"
+printf "    NIC & Bridge State : %s (%s %s -> br0 %s)\n" "${NIC_STATE}" "${PHYS_NIC}" "${PHYS_MAC}" "${BR0_IP}"
+printf "    Guest TAP State    : %s (%s)\n" "${TAP_STATE}" "${TAP_IF:-tap-talos0}"
+printf "\n  [Memory & ZFS ARC]\n"
+printf "    Memory State       : %s (%d MiB avail / %d MiB total)\n" "${MEMORY_STATE}" "${MEM_AVAIL_MB}" "${MEM_TOTAL_MB}"
+printf "    Talos QEMU RSS     : %d MiB (configured -m %s)\n" "${QEMU_RSS_MB}" "${VM_MEM}"
+printf "    ZFS ARC Cache      : %d MiB / %d MiB max (%s%% hit rate)\n" "${ZFS_ARC_MB}" "${ZFS_ARC_MAX_MB}" "${ZFS_ARC_HIT_PCT}"
+printf "\n  [Storage & NFS]\n"
+printf "    ZFS Pool (storage) : %s\n" "${ZFS_POOL_STATE}"
+printf "    Kernel NFS Server  : %s (plex_export=%s, nvme=%s)\n" "${NFS_STATE}" "${PLEX_EXPORT_STATE}" "${NVME_STATE}"
+printf "\n  [Talos KVM Guest & VFIO]\n"
+printf "    VM Lifecycle State : %s (name=%s, pid=%s, qmp=%s)\n" "${VM_STATE}" "${VM_NAME}" "${QEMU_PID:-none}" "${QMP_STATE}"
+printf "    Hypervisor Accel   : %s (%s vCPUs, MAC %s)\n" "${ACCEL_STATE}" "${VM_CPUS}" "${VM_MAC}"
+printf "    System Disk State  : %s (%s)\n" "${STORAGE_STATE}" "${STORAGE_SOURCE}"
+printf "    Intel iGPU VFIO    : %s (%s)\n" "${GPU_STATE}" "${IGPU_BDF:-none}"
+printf "    State JSON Path    : %s\n" "${JSON_STATE_FILE}"
+printf "======================================================================\n"

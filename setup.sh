@@ -39,9 +39,10 @@ rc-update add killprocs shutdown
 rc-update add mount-ro shutdown
 
 # Ensure required runtime directories and permissions exist
-mkdir -p /boot/efi /var/lib/nfs /etc/exports.d /var/log /tmp /run
-chmod 600 /etc/ssh/ssh_host_ed25519_key
+mkdir -p /boot/efi /var/lib/nfs /etc/exports.d /var/log /tmp /run /run/drift /usr/local/bin
+[ -f /etc/ssh/ssh_host_ed25519_key ] && chmod 600 /etc/ssh/ssh_host_ed25519_key
 chmod 700 /root/.ssh
-chmod 600 /root/.ssh/authorized_keys
+[ -f /root/.ssh/authorized_keys ] && chmod 600 /root/.ssh/authorized_keys
 chmod +x /etc/init.d/drift-identity /etc/init.d/talos-vm
+[ -f /usr/local/bin/drift-status ] && chmod +x /usr/local/bin/drift-status
 sed -i -E 's|^(root:.*:)/bin/.*sh$|\1/bin/bash|' /etc/passwd

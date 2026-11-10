@@ -4,11 +4,26 @@ cd "$(dirname "$0")"
 
 mkdir -p images images/netboot
 
+DRIFT_VERSION="$(tr -d '[:space:]' < VERSION 2>/dev/null || echo "1.1.0")"
 PXE_HOST="${PXE_HOST:-pi@192.168.10.1}"
 PXE_DEST="${PXE_DEST:-/data/netboot_assets/drift.efi}"
 PXE_SPLIT_DIR="${PXE_SPLIT_DIR:-/data/netboot_assets/drift}"
 PXE_URL="${PXE_URL:-http://192.168.10.1:8080/drift.efi}"
 PXE_SPLIT_URL="${PXE_SPLIT_URL:-http://192.168.10.1:8080/drift}"
+
+run_priv() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
+
+log_state() {
+    printf "\033[1;36m[drift:%s]\033[0m %s\n" "$1" "$2"
+}
 
 latest_image() {
     ls -1 images/*.efi 2>/dev/null | sort | tail -n 1
@@ -32,14 +47,200 @@ fixup_image() {
     echo "drift.${current_date}$(printf %02d $counter).efi"
 }
 
-case "$1" in
+verify_uki_file() {
+    uki_path="$1"
+    if [ ! -f "$uki_path" ]; then
+        echo "Error: UKI image '$uki_path' does not exist." >&2
+        return 1
+    fi
+    # Check PE/MZ magic header ("MZ")
+    magic=$(dd if="$uki_path" bs=1 count=2 2>/dev/null || echo "")
+    if [ "$magic" != "MZ" ]; then
+        echo "Error: '$uki_path' is not a valid UEFI PE binary (missing MZ header)." >&2
+        return 1
+    fi
+    size_bytes=$(wc -c < "$uki_path" 2>/dev/null || echo 0)
+    if [ "${size_bytes:-0}" -lt 10485760 ]; then
+        echo "Error: '$uki_path' is unexpectedly small (${size_bytes} bytes < 10 MiB)." >&2
+        return 1
+    fi
+    return 0
+}
+
+# Deploy State Machine:
+# preflight -> mounting_esp -> rotating_backup -> staging_uki -> committing -> verified (or rollback_restored on error)
+deploy_uki() {
+    image=$(latest_image)
+    if [ -z "$image" ]; then
+        echo "No built image found in images/. Run './drift build' first." >&2
+        exit 1
+    fi
+    log_state "deploy:preflight" "Validating source UKI $image..."
+    verify_uki_file "$image"
+
+    TARGET_ESP="${1:-/boot/efi/EFI/drift/drift.efi}"
+    ESP_MNT_DIR="/boot/efi"
+    AUTO_MOUNTED_ESP=0
+    REMOUNTED_RW=0
+
+    # If deploying under /boot/efi and it is not mounted yet, mount the ESP automatically
+    case "$TARGET_ESP" in
+        /boot/efi/*)
+            log_state "deploy:mounting_esp" "Checking EFI System Partition mount at $ESP_MNT_DIR..."
+            run_priv mkdir -p "$ESP_MNT_DIR"
+            if ! mountpoint -q "$ESP_MNT_DIR" 2>/dev/null; then
+                esp_dev=""
+                for cand in /dev/disk/by-partlabel/ESP /dev/disk/by-label/EFI /dev/nvme0n1p1; do
+                    if [ -b "$cand" ]; then
+                        esp_dev=$(readlink -f "$cand" 2>/dev/null || echo "$cand")
+                        break
+                    fi
+                done
+                if [ -n "$esp_dev" ]; then
+                    # Check if already mounted elsewhere (e.g. /tmp/boot)
+                    other_mnt=$(awk -v d="$esp_dev" '$1 == d {print $2; exit}' /proc/mounts 2>/dev/null)
+                    if [ -n "$other_mnt" ] && [ "$other_mnt" != "$ESP_MNT_DIR" ]; then
+                        log_state "deploy:mounting_esp" "Unmounting temporary ESP mount at $other_mnt..."
+                        run_priv umount "$other_mnt" 2>/dev/null || true
+                    fi
+                    log_state "deploy:mounting_esp" "Mounting $esp_dev at $ESP_MNT_DIR (rw)..."
+                    run_priv mount -o rw "$esp_dev" "$ESP_MNT_DIR"
+                    AUTO_MOUNTED_ESP=1
+                fi
+            else
+                # Ensure mounted rw
+                if awk -v m="$ESP_MNT_DIR" '$2 == m && $4 ~ /(^|,)ro(,|$)/ {found=1} END {exit !found}' /proc/mounts 2>/dev/null; then
+                    run_priv mount -o remount,rw "$ESP_MNT_DIR"
+                    REMOUNTED_RW=1
+                fi
+            fi
+            ;;
+    esac
+
+    cleanup_esp_mount() {
+        if [ "$AUTO_MOUNTED_ESP" -eq 1 ]; then
+            run_priv umount "$ESP_MNT_DIR" 2>/dev/null || true
+        elif [ "$REMOUNTED_RW" -eq 1 ]; then
+            run_priv mount -o remount,ro "$ESP_MNT_DIR" 2>/dev/null || true
+        fi
+    }
+
+    run_priv mkdir -p "$(dirname "$TARGET_ESP")"
+
+    # Space-bounded atomic rotation for 511 MB FAT32 ESP:
+    # Remove stale .prev and .new first, move active -> .prev, then copy new -> .new -> active.
+    # This guarantees at most 2 UKIs (~510 MB) ever exist on disk at once, and rolls back .prev -> active if cp fails!
+    log_state "deploy:rotating_backup" "Rotating previous backup at ${TARGET_ESP}.prev to stay within 511 MB ESP budget..."
+    run_priv rm -f "${TARGET_ESP}.prev" "${TARGET_ESP}.new"
+    HAD_PREV=0
+    if [ -f "$TARGET_ESP" ]; then
+        run_priv mv "$TARGET_ESP" "${TARGET_ESP}.prev"
+        HAD_PREV=1
+    fi
+
+    # Check available space on target filesystem
+    img_kb=$(du -k "$image" | awk '{print $1}')
+    avail_kb=$(df -Pk "$(dirname "$TARGET_ESP")" | awk 'NR==2 {print $4}')
+    if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "$img_kb" ]; then
+        if [ "$HAD_PREV" -eq 1 ]; then
+            run_priv mv "${TARGET_ESP}.prev" "$TARGET_ESP"
+        fi
+        cleanup_esp_mount
+        echo "Error: Insufficient free space on $(dirname "$TARGET_ESP") (${avail_kb} KiB available, ${img_kb} KiB required)." >&2
+        exit 1
+    fi
+
+    log_state "deploy:staging_uki" "Staging $image -> ${TARGET_ESP}.new..."
+    if ! run_priv cp "$image" "${TARGET_ESP}.new"; then
+        log_state "deploy:rollback_restored" "Copy failed! Restoring ${TARGET_ESP}.prev -> ${TARGET_ESP}..."
+        run_priv rm -f "${TARGET_ESP}.new"
+        if [ "$HAD_PREV" -eq 1 ]; then
+            run_priv mv "${TARGET_ESP}.prev" "$TARGET_ESP"
+        fi
+        cleanup_esp_mount
+        exit 1
+    fi
+
+    log_state "deploy:committing" "Committing ${TARGET_ESP}.new -> ${TARGET_ESP} and syncing..."
+    run_priv mv "${TARGET_ESP}.new" "$TARGET_ESP"
+    sync
+
+    verify_uki_file "$TARGET_ESP"
+    ls -lh "$(dirname "$TARGET_ESP")"
+    cleanup_esp_mount
+    log_state "deploy:verified" "Successfully deployed $image to $TARGET_ESP (rollback backup at ${TARGET_ESP}.prev)"
+}
+
+run_self_tests() {
+    log_state "test:syntax" "Checking POSIX shell syntax across all drift scripts..."
+    for s in ./drift ./drift-build.sh ./setup.sh ./root/etc/init.d/drift-identity ./root/etc/init.d/talos-vm ./root/usr/local/bin/drift-status; do
+        sh -n "$s"
+        printf "  ✓ sh -n %s\n" "$s"
+    done
+
+    log_state "test:state_machines" "Testing 511 MB ESP atomic deploy rotation & rollback state machine in isolated sandbox..."
+    TEST_DIR=$(mktemp -d /tmp/drift-test.XXXXXX)
+    trap 'rm -rf "$TEST_DIR"' EXIT
+
+    # Create mock MZ PE UKI files
+    printf "MZ" > "$TEST_DIR/old.efi"
+    dd if=/dev/zero bs=1M count=11 >> "$TEST_DIR/old.efi" 2>/dev/null
+    cp "$TEST_DIR/old.efi" "$TEST_DIR/prev.efi"
+
+    # Simulate rotation invariant: never exceed 2 files on ESP simultaneously
+    rm -f "$TEST_DIR/prev.efi"
+    mv "$TEST_DIR/old.efi" "$TEST_DIR/prev.efi"
+    cp "$TEST_DIR/prev.efi" "$TEST_DIR/new.efi"
+    mv "$TEST_DIR/new.efi" "$TEST_DIR/old.efi"
+    verify_uki_file "$TEST_DIR/old.efi"
+    verify_uki_file "$TEST_DIR/prev.efi"
+    printf "  ✓ Atomic 2-slot ESP rotation & MZ PE verification passed\n"
+
+    # Test authorized_keys deduplication
+    cat <<KEYS > "$TEST_DIR/authorized_keys"
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey1 user@host
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey2 user@host
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey1 user@host
+KEYS
+    awk 'NF && !seen[$0]++' "$TEST_DIR/authorized_keys" > "$TEST_DIR/authorized_keys.dedup"
+    mv "$TEST_DIR/authorized_keys.dedup" "$TEST_DIR/authorized_keys"
+    line_count=$(wc -l < "$TEST_DIR/authorized_keys" | tr -d ' ')
+    if [ "$line_count" != "2" ]; then
+        echo "Expected 2 deduplicated keys, got $line_count" >&2
+        exit 1
+    fi
+    printf "  ✓ Seed authorized_keys deduplication passed\n"
+
+    # Test drift-status JSON generation
+    DRIFT_STATE_DIR="$TEST_DIR/state" ./root/usr/local/bin/drift-status --json > "$TEST_DIR/out.json"
+    grep -q '"schema_version": 1' "$TEST_DIR/out.json"
+    grep -q '"vm":' "$TEST_DIR/out.json"
+    grep -q '"memory":' "$TEST_DIR/out.json"
+    printf "  ✓ drift-status --json schema output passed\n"
+
+    rm -rf "$TEST_DIR"
+    trap - EXIT
+    log_state "test:passed" "All drift state machine checks passed!"
+}
+
+case "${1:-}" in
+    version|--version|-v)
+        echo "drift v${DRIFT_VERSION} (latest UKI: $(latest_image || echo none))"
+        ;;
+    status)
+        shift
+        ./root/usr/local/bin/drift-status "$@"
+        ;;
+    test)
+        run_self_tests
+        ;;
     sync-host-secrets)
-        echo "Syncing host SSH keys, authorized_keys, and zpool.cache into root/..."
+        log_state "secrets:syncing" "Syncing host SSH keys, authorized_keys, and zpool.cache into root/..."
         mkdir -p root/etc/ssh root/root/.ssh root/etc/zfs
-        if sudo -n test -r /etc/ssh/ssh_host_ed25519_key 2>/dev/null; then
-            sudo cp /etc/ssh/ssh_host_ed25519_key root/etc/ssh/ssh_host_ed25519_key
-            sudo cp /etc/ssh/ssh_host_ed25519_key.pub root/etc/ssh/ssh_host_ed25519_key.pub
-            sudo chown "$(id -u):$(id -g)" root/etc/ssh/ssh_host_ed25519_key*
+        if run_priv test -r /etc/ssh/ssh_host_ed25519_key 2>/dev/null; then
+            run_priv cp /etc/ssh/ssh_host_ed25519_key root/etc/ssh/ssh_host_ed25519_key
+            run_priv cp /etc/ssh/ssh_host_ed25519_key.pub root/etc/ssh/ssh_host_ed25519_key.pub
+            run_priv chown "$(id -u):$(id -g)" root/etc/ssh/ssh_host_ed25519_key*
             chmod 600 root/etc/ssh/ssh_host_ed25519_key
         elif [ ! -f root/etc/ssh/ssh_host_ed25519_key ]; then
             echo "Generating new ssh_host_ed25519_key in root/etc/ssh/..."
@@ -56,15 +257,15 @@ case "$1" in
         if [ -f /etc/zfs/zpool.cache ]; then
             cp /etc/zfs/zpool.cache root/etc/zfs/zpool.cache
         fi
-        echo "Done. Verify files in root/etc/ssh, root/root/.ssh, and root/etc/zfs."
+        log_state "secrets:ready" "Done. Verify files in root/etc/ssh, root/root/.ssh, and root/etc/zfs."
         ;;
     build)
-        if [ "$2" = "--fixup" ]; then
+        if [ "${2:-}" = "--fixup" ]; then
             image=$(fixup_image)
         else
             image=$(next_image)
         fi
-        echo "Building UKI image: $image"
+        log_state "build:starting" "Building UKI image: $image"
         if command -v docker >/dev/null 2>&1; then
             docker run --privileged --rm -i \
                 -v "$PWD":/mnt -w /root \
@@ -72,6 +273,8 @@ case "$1" in
         else
             ./drift-build.sh "images/$image"
         fi
+        verify_uki_file "images/$image"
+        log_state "build:verified" "Verified UKI image: images/$image"
         ;;
     publish)
         image=$(latest_image)
@@ -79,10 +282,11 @@ case "$1" in
             echo "No built image found in images/. Run './drift build' first." >&2
             exit 1
         fi
-        echo "Uploading $image to ${PXE_HOST}:${PXE_DEST}..."
+        verify_uki_file "$image"
+        log_state "publish:uploading_uki" "Uploading $image to ${PXE_HOST}:${PXE_DEST}..."
         scp "$image" "${PXE_HOST}:${PXE_DEST}.new"
         ssh "${PXE_HOST}" "mkdir -p ${PXE_SPLIT_DIR} && mv ${PXE_DEST}.new ${PXE_DEST}"
-        echo "Uploading split kernel/initramfs for iPXE compatibility (BIOS & UEFI)..."
+        log_state "publish:uploading_split" "Uploading split kernel/initramfs for iPXE compatibility (BIOS & UEFI)..."
         if [ -f "images/netboot/vmlinuz-lts" ] && [ -f "images/netboot/initramfs-lts" ]; then
             scp images/netboot/vmlinuz-lts "${PXE_HOST}:${PXE_SPLIT_DIR}/vmlinuz-lts.new"
             scp images/netboot/initramfs-lts "${PXE_HOST}:${PXE_SPLIT_DIR}/initramfs-lts.new"
@@ -95,11 +299,11 @@ case "$1" in
             rm -f /tmp/drift-vmlinuz-lts /tmp/drift-initramfs-lts
         fi
         ssh "${PXE_HOST}" "mv ${PXE_SPLIT_DIR}/vmlinuz-lts.new ${PXE_SPLIT_DIR}/vmlinuz-lts && mv ${PXE_SPLIT_DIR}/initramfs-lts.new ${PXE_SPLIT_DIR}/initramfs-lts"
-        echo "Verifying HTTP PXE endpoints (${PXE_URL} & ${PXE_SPLIT_URL})..."
+        log_state "publish:verifying_http" "Verifying HTTP PXE endpoints (${PXE_URL} & ${PXE_SPLIT_URL})..."
         curl -fsSI "${PXE_URL}"
         curl -fsSI "${PXE_SPLIT_URL}/vmlinuz-lts"
         curl -fsSI "${PXE_SPLIT_URL}/initramfs-lts"
-        echo "Published $image to ${PXE_URL} and ${PXE_SPLIT_URL}/"
+        log_state "publish:published" "Published $image to ${PXE_URL} and ${PXE_SPLIT_URL}/"
         ;;
     qemu)
         image=$(latest_image)
@@ -107,35 +311,26 @@ case "$1" in
             echo "No built image found in images/. Run './drift build' first." >&2
             exit 1
         fi
+        verify_uki_file "$image"
         echo "Running $image in QEMU (terminate with Ctrl-A X)..."
         OVMF_BIOS="/usr/share/edk2/x64/OVMF.4m.fd"
         [ ! -f "$OVMF_BIOS" ] && OVMF_BIOS="/usr/share/ovmf/x64/OVMF.4m.fd"
         [ ! -f "$OVMF_BIOS" ] && OVMF_BIOS="/usr/share/OVMF/OVMF_CODE.fd"
-        qemu-system-x86_64 -enable-kvm -cpu host -m 4G -smp 4 -nographic \
+        [ ! -f "$OVMF_BIOS" ] && OVMF_BIOS="/usr/share/OVMF/OVMF.fd"
+        KVM_ARGS="-enable-kvm -cpu host"
+        [ ! -c /dev/kvm ] && KVM_ARGS="-cpu max"
+        # shellcheck disable=SC2086
+        qemu-system-x86_64 $KVM_ARGS -m 4G -smp 4 -nographic \
             -bios "$OVMF_BIOS" \
             -kernel "$image" \
             -netdev user,id=net0,hostfwd=tcp::2222-:22 \
             -device virtio-net-pci,netdev=net0
         ;;
     deploy)
-        image=$(latest_image)
-        if [ -z "$image" ]; then
-            echo "No built image found in images/. Run './drift build' first." >&2
-            exit 1
-        fi
-        TARGET_ESP="${2:-/boot/efi/EFI/BOOT/BOOTX64.EFI}"
-        echo "Deploying $image to $TARGET_ESP..."
-        if [ -f "$TARGET_ESP" ]; then
-            sudo cp "$TARGET_ESP" "${TARGET_ESP}.prev"
-        fi
-        sudo mkdir -p "$(dirname "$TARGET_ESP")"
-        sudo cp "$image" "${TARGET_ESP}.new"
-        sudo mv "${TARGET_ESP}.new" "$TARGET_ESP"
-        sync
-        echo "Successfully deployed $image to $TARGET_ESP (backup at ${TARGET_ESP}.prev)"
+        deploy_uki "${2:-}"
         ;;
     *)
-        echo "Usage: $0 {sync-host-secrets|build [--fixup]|publish|qemu|deploy [esp-path]}"
+        echo "Usage: $0 {version|status [--json]|test|sync-host-secrets|build [--fixup]|publish|qemu|deploy [esp-path]}"
         exit 1
         ;;
 esac

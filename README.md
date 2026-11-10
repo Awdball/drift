@@ -6,30 +6,32 @@ It can boot as an immutable, in-memory RAM OS on **any x86_64 host machine** or 
 
 ---
 
-## Architecture & Dynamic Self-Configuration
+## Architecture & Explicit State Machines
 
-`drift` is hardware-agnostic and self-configuring out of the box:
+`drift` is hardware-agnostic, self-configuring, and governed by explicit runtime state machines tracked in `/run/drift/` (`identity.env`, `talos-vm.env`, and `state.json`):
 
-1. **Carrier-Active NIC Auto-Detection:**
-   - Scans physical network adapters for an active carrier link (ignoring virtual, bridge, wireless, or down interfaces).
-   - Binds the active adapter to `br0` with hardware MAC preservation so bridge addresses never flip when tap devices attach.
+1. **Carrier-Active NIC Discovery (`NIC_STATE`):**
+   - `probing` → `carrier_up` | `no_carrier_fallback` | `virtual_nic` | `default_eth0`
+   - Brings candidate physical network adapters administratively `UP` during early boot and polls for PHY carrier negotiation before binding to `br0` with hardware MAC lock.
 
-2. **Dynamic Host & VM Identity:**
-   - Generates deterministic hostnames (`drift-<mac_suffix>`) and locally-administered unicast VM MACs (`52:54:xx:xx:xx:xx`) derived from the physical NIC MAC.
-   - Built-in hardware profiles provide instant recognition for core cluster nodes (e.g. `hv` and `steam-worker`).
+2. **Dynamic Host, Seed & Secret Identity (`IDENTITY_STATE`, `SEED_STATE`, `SSH_KEY_STATE`):**
+   - `IDENTITY_STATE`: `seed_override` | `hardware_profile` (`hv`, `steam-worker`) | `dynamic_mac` (`drift-<mac_suffix>`)
+   - `SEED_STATE`: `loaded` | `none_found` (deduplicating candidate VFAT block devices by canonical path)
+   - `SSH_KEY_STATE`: `esp_restored` | `esp_persisted` | `baked_initramfs` | `ephemeral_ram`
 
-3. **Dynamic Resource Sizing:**
-   - Computes total physical RAM and allocates ~60% to the Talos guest VM, reserving the remainder for host ZFS ARC, kernel slab, and buffers.
-   - Reserves 2 CPU cores for hypervisor operations and assigns the remaining cores to the VM.
+3. **Storage & Host NVMe / NFS Export Lifecycle (`STORAGE_STATE`, `NVME_STATE`, `PLEX_EXPORT_STATE`):**
+   - `STORAGE_STATE`: `persistent_block` | `persistent_image` (`.raw` / `.qcow2`) | `ephemeral_qcow2` | `skipped_small_host`
+   - Decouples host NVMe carrier mounting (`/mnt/nvme` and `/plex/config` NFS bind-mount) from guest system disk discovery, and preserves ephemeral QCOW2 disks across service restarts.
 
-4. **Dynamic Accelerator Passthrough (Intel iGPU / QuickSync):**
-   - Automatically probes PCI devices for Intel graphics controllers (Vendor `0x8086`, Class `0x0300` / `0x0380`).
-   - Late-binds `vfio-pci` and attaches the GPU to the VM.
-   - If binding fails or the host lacks an Intel GPU, it logs a warning and falls back to headless operation without interrupting VM launch.
+4. **Hypervisor Acceleration & Intel iGPU VFIO Passthrough (`ACCEL_STATE`, `GPU_STATE`):**
+   - `ACCEL_STATE`: `kvm` (hardware VT-x/SVM + `vhost-net`) | `tcg` (software emulation fallback)
+   - `GPU_STATE`: `bound_vfio` | `disabled` | `not_present` | `iommu_unavailable` | `bind_failed_headless`
+   - Verifies active IOMMU group presence before unbinding host display consoles and skips redundant rebinds on service restart.
 
-5. **Safe Storage Discovery (Persistent vs Ephemeral):**
-   - Discovers storage partitions by GPT partition label (`/dev/disk/by-partlabel/talos-sys`, `/dev/disk/by-partlabel/plex-nvme`) or raw disk images.
-   - If no persistent partition is found, it automatically instantiates a non-destructive, ephemeral 20 GiB sparse QCOW2 image in `/tmp` for temporary or rescue operation.
+5. **Talos Guest Lifecycle, Graceful QMP Shutdown & Bootstrap (`VM_STATE`, `BOOTSTRAP_STATE`):**
+   - `VM_STATE`: `starting` → `running` → `shutting_down` → `stopped` | `skipped`
+   - `BOOTSTRAP_STATE`: `idle` | `skipped_no_config` | `skipped_unknown_target` | `probing` | `already_configured` | `config_applied` | `timeout`
+   - Sends QMP `system_powerdown` and polls for clean guest ACPI exit before OpenRC sends `SIGTERM`.
 
 ---
 
@@ -47,15 +49,16 @@ NODE_NETMASK="255.255.255.0"
 NODE_GATEWAY="192.168.10.1"
 NODE_DNS="192.168.10.1"
 
-# Talos VM sizing
+# Talos VM sizing & optional bootstrap IP
 VM_CPUS="8"
 VM_MEM="16G"
 VM_MAC="52:54:00:12:34:56"
+TALOS_VM_IP="192.168.10.55"
 
 # Hardware passthrough: "auto", "disable", or specific PCI BDF (e.g. "0000:00:02.0")
 PASSTHROUGH_GPU="auto"
 
-# Custom storage path (defaults to /dev/disk/by-partlabel/talos-sys)
+# Custom storage path (block device or .raw/.qcow2 image file)
 TALOS_SYS_DISK="/dev/disk/by-partlabel/talos-sys"
 
 # SSH access
@@ -80,7 +83,19 @@ When booting from an ESP or USB drive, `drift` automatically checks for `/EFI/dr
 
 ---
 
-## Building and Deploying
+## Operations, Observability & Deployment
+
+### Inspect Runtime State Machines (Human & Agent JSON)
+Inspect all hypervisor, memory, ZFS ARC, network, VFIO, and Talos guest state machines:
+```sh
+./drift status          # or: drift-status
+./drift status --json   # or: drift-status --json (writes /run/drift/state.json)
+```
+
+### Run Syntax & State Machine Self-Tests
+```sh
+./drift test
+```
 
 ### Build UKI & Netboot Assets
 Builds both the standalone Unified Kernel Image (`images/drift.YYYYMMDDXX.efi`) and the split netboot assets (`images/netboot/vmlinuz-lts`, `images/netboot/initramfs-lts`):
@@ -95,10 +110,10 @@ Boot the image directly using local UEFI emulation:
 ./drift qemu
 ```
 
-### Deploy to Local EFI System Partition
-Deploys the built UKI to `/boot/efi/EFI/BOOT/BOOTX64.EFI` (or custom path) with automatic `.prev` backup:
+### Deploy to Local EFI System Partition (511 MB Safe Atomic Rotation)
+Deploys the latest verified UKI to `/boot/efi/EFI/drift/drift.efi` (or custom path), automatically mounting the ESP if needed, rotating `.prev` within the 2-image 511 MB FAT32 budget, and rolling back automatically if staging fails:
 ```sh
-./drift deploy /tmp/boot/EFI/drift/drift.efi
+./drift deploy
 ```
 
 ### Publish to PXE / Netboot Server

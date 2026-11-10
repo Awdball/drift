@@ -3,10 +3,11 @@
 /QEMU_EFI.fd
 /OVMF_VARS.fd
 /*.img
+/alpine-make-rootfs
 
-# Host-specific secrets & cache injected before build
+# Host-specific secrets, large external binaries & cache injected before build
 /root/etc/ssh/ssh_host_*_key
 /root/etc/ssh/ssh_host_*_key.pub
 /root/root/.ssh/authorized_keys
 /root/etc/zfs/zpool.cache
-
+/root/usr/local/bin/talosctl
