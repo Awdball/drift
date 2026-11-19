@@ -1,0 +1,3 @@
+# /etc/conf.d/smartctl-exporter
+ARGS="--smartctl.scan-device-type=sat"
+command_user="root"

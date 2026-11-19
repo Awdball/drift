@@ -33,6 +33,9 @@ rc-update add rpcbind default
 rc-update add nfs default
 rc-update add zfs-share default
 rc-update add talos-vm default
+rc-update add node-exporter default
+rc-update add smartctl-exporter default
+rc-update add zfs-exporter default
 
 # Shutdown runlevel
 rc-update add killprocs shutdown
@@ -43,6 +46,12 @@ mkdir -p /boot/efi /var/lib/nfs /etc/exports.d /var/log /tmp /run /run/drift /us
 [ -f /etc/ssh/ssh_host_ed25519_key ] && chmod 600 /etc/ssh/ssh_host_ed25519_key
 chmod 700 /root/.ssh
 [ -f /root/.ssh/authorized_keys ] && chmod 600 /root/.ssh/authorized_keys
-chmod +x /etc/init.d/drift-identity /etc/init.d/talos-vm
+chmod +x /etc/init.d/drift-identity /etc/init.d/talos-vm /etc/init.d/zfs-exporter
 [ -f /usr/local/bin/drift-status ] && chmod +x /usr/local/bin/drift-status
 sed -i -E 's|^(root:.*:)/bin/.*sh$|\1/bin/bash|' /etc/passwd
+
+# Apply optional local console root password hash (gitignored, never left in rootfs)
+if [ -f /etc/drift-root-passhash ]; then
+    chpasswd -e < /etc/drift-root-passhash
+    rm -f /etc/drift-root-passhash
+fi

@@ -41,3 +41,8 @@ netcat-openbsd
 bind-tools
 nmap
 bash
+# Prometheus Monitoring Exporters
+prometheus-node-exporter
+prometheus-node-exporter-openrc
+prometheus-smartctl-exporter
+prometheus-smartctl-exporter-openrc

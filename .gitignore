@@ -11,3 +11,5 @@
 /root/root/.ssh/authorized_keys
 /root/etc/zfs/zpool.cache
 /root/usr/local/bin/talosctl
+/root/etc/drift-root-passhash
+/root/usr/local/bin/zfs_exporter

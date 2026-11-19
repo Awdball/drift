@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh
+
+description="Prometheus exporter for ZFS metrics"
+command="/usr/local/bin/zfs_exporter"
+command_args="--collector.dataset-snapshot --web.listen-address=:9134"
+supervisor="supervise-daemon"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+    need zfs-mount
+    after zfs-mount
+}

@@ -12,7 +12,7 @@ It can boot as an immutable, in-memory RAM OS on **any x86_64 host machine** or 
 
 1. **Carrier-Active NIC Discovery (`NIC_STATE`):**
    - `probing` → `carrier_up` | `no_carrier_fallback` | `virtual_nic` | `default_eth0`
-   - Brings candidate physical network adapters administratively `UP` during early boot and polls for PHY carrier negotiation before binding to `br0` with hardware MAC lock.
+   - Brings candidate physical network adapters administratively `UP` during early boot and polls for PHY carrier negotiation before binding to `br0` with `ifupdown-ng` hardware MAC lock (`hwaddress <mac>`).
 
 2. **Dynamic Host, Seed & Secret Identity (`IDENTITY_STATE`, `SEED_STATE`, `SSH_KEY_STATE`):**
    - `IDENTITY_STATE`: `seed_override` | `hardware_profile` (`hv`, `steam-worker`) | `dynamic_mac` (`drift-<mac_suffix>`)
@@ -25,8 +25,8 @@ It can boot as an immutable, in-memory RAM OS on **any x86_64 host machine** or 
 
 4. **Hypervisor Acceleration & Intel iGPU VFIO Passthrough (`ACCEL_STATE`, `GPU_STATE`):**
    - `ACCEL_STATE`: `kvm` (hardware VT-x/SVM + `vhost-net`) | `tcg` (software emulation fallback)
-   - `GPU_STATE`: `bound_vfio` | `disabled` | `not_present` | `iommu_unavailable` | `bind_failed_headless`
-   - Verifies active IOMMU group presence before unbinding host display consoles and skips redundant rebinds on service restart.
+   - `GPU_STATE`: `bound_vfio` | `skipped_by_user` | `disabled` | `not_present` | `iommu_unavailable` | `bind_failed_headless`
+   - Verifies active IOMMU group presence, offers a 5-second interruptible countdown on `/dev/tty1` before unbinding host display consoles, and skips redundant rebinds on service restart.
 
 5. **Talos Guest Lifecycle, Graceful QMP Shutdown & Bootstrap (`VM_STATE`, `BOOTSTRAP_STATE`):**
    - `VM_STATE`: `starting` → `running` → `shutting_down` → `stopped` | `skipped`
@@ -57,6 +57,8 @@ TALOS_VM_IP="192.168.10.55"
 
 # Hardware passthrough: "auto", "disable", or specific PCI BDF (e.g. "0000:00:02.0")
 PASSTHROUGH_GPU="auto"
+# Seconds to wait on /dev/tty1 for an operator keypress to skip iGPU VFIO takeover (0 = no prompt)
+VFIO_PROMPT_TIMEOUT="5"
 
 # Custom storage path (block device or .raw/.qcow2 image file)
 TALOS_SYS_DISK="/dev/disk/by-partlabel/talos-sys"
@@ -68,6 +70,20 @@ AUTHORIZED_KEYS="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@workstation"
 ### Persistent SSH Host Keys
 
 When booting from an ESP or USB drive, `drift` automatically checks for `/EFI/drift/ssh_host_ed25519_key`. If present, it restores the key so SSH fingerprints remain identical across boots. If absent and the drive is writable, `drift` generates a key and saves it to the partition.
+
+### Local Console Recovery & Root Password
+
+Because normal boot unbinds the local display console (`vtcon*` / `efi-framebuffer`) to pass the Intel iGPU to `talos-hv`, `drift` includes two local recovery safeguards for offline administration:
+
+1. **Interruptible VFIO Takeover (`/dev/tty1`):** Right before unbinding the display, `talos-vm` displays a 5-second prompt (`VFIO_PROMPT_TIMEOUT`, configurable via `drift.env`). Pressing any key skips iGPU VFIO binding (`GPU_STATE="skipped_by_user"`), keeps the physical display and keyboard active, and continues booting `talos-hv` headless. Unattended boots time out after 5 seconds and proceed with normal QuickSync VFIO passthrough.
+2. **Local Console Root Password (Key-Only SSH):** To allow local `tty1` root login without weakening SSH, `root/etc/ssh/sshd_config.d/99-drift-key-only.conf` enforces `PermitRootLogin prohibit-password` and `PasswordAuthentication no`. Place a gitignored SHA-512 password hash in `root/etc/drift-root-passhash` before building:
+   ```sh
+   read -r -s -p "New root password: " PW; echo
+   HASH=$(printf "%s\n" "$PW" | mkpasswd -m sha512); unset PW
+   printf "root:%s\n" "$HASH" > /storage/dev-projects/drift/root/etc/drift-root-passhash
+   chmod 600 /storage/dev-projects/drift/root/etc/drift-root-passhash
+   ```
+   During `./drift build`, `setup.sh` applies the hash via `chpasswd -e` and removes `/etc/drift-root-passhash` from the rootfs before packing the UKI.
 
 ---
 

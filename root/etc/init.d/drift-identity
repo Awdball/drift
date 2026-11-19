@@ -304,6 +304,7 @@ VM_MEM="${VM_MEM}"
 PHYS_NIC="${PHYS_NIC}"
 PHYS_MAC="${PHYS_MAC}"
 PASSTHROUGH_GPU="${PASSTHROUGH_GPU}"
+VFIO_PROMPT_TIMEOUT="${VFIO_PROMPT_TIMEOUT:-5}"
 TALOS_SYS_DISK="${TALOS_SYS_DISK}"
 TALOS_VM_IP="${TALOS_VM_IP}"
 IDENTITY_STATE="${IDENTITY_STATE}"
@@ -313,7 +314,7 @@ CONF
 
     HWADDR_LINE=""
     if [ -n "$PHYS_MAC" ]; then
-        HWADDR_LINE="    hwaddress ether ${PHYS_MAC}"
+        HWADDR_LINE="    hwaddress ${PHYS_MAC}"
     fi
 
     if [ "$NODE_IP" = "dhcp" ]; then
